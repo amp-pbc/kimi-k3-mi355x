@@ -1,0 +1,496 @@
+# Kimi-K3 — AGGREGATED serving on AMD MI355X (8x per node).
+#
+# Each GPU node runs a complete TP8 replica that does BOTH prefill and decode;
+# an Infera router (or any load balancer) fronts N identical replicas with
+# round-robin. This is the simplest, most robust baseline: no host RDMA prep,
+# no Mooncake, no prefill/decode split. Use it when you have < 3 GPU nodes or
+# don't need PD. See docs/02-serving-aggregated.md.
+#
+# The workers are a DaemonSet: one lands on every node labelled
+# node-role.kubernetes.io/gpu-worker="", self-stages weights on join, and
+# self-registers with the router via a pod annotation (hence the RBAC below).
+#
+# PLACEHOLDERS to fill in:
+#   /mnt/nvme/kimi-k3/weights   hostPath where weights are staged on each node
+#                               (see k8s/weights-stage-job.yaml)
+#   image @sha256 / tags        the AMD/Infera overlay + engine images
+#   node-role labels            gpu-worker for GPU nodes, cpu for the router
+# ---------------------------------------------------------------------------
+# ServiceAccount + RBAC: workers patch their own pod with the
+# infera.amd.com/worker-info annotation so the router can discover them via
+# the Kubernetes API (--discovery-backend kubernetes).
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kimi-k3-serving, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: kimi-k3-serving, namespace: default}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: kimi-k3-serving, namespace: default}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: kimi-k3-serving}
+subjects: [{kind: ServiceAccount, name: kimi-k3-serving, namespace: default}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infera
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  replicas: 2   # HA: router is the registration tracker; 2 removes the SPOF
+  progressDeadlineSeconds: 900
+  # maxUnavailable:1 so the rollout can retire an old replica to free a node for
+  # the replacement. Required because the pod anti-affinity below is required and
+  # a surge pod cannot co-locate; with the default (maxUnavailable:0) a rollout
+  # would deadlock whenever fewer than 3 CPU nodes are schedulable.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 1}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infera
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infera
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      serviceAccountName: kimi-k3-serving
+      # The router tokenizes every prompt for prefix hashing, so it is the one
+      # CPU-bound component and belongs on the dedicated CPU node. No GPU
+      # toleration on purpose: it must never land on the GPU node.
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      # Spread the 2 router replicas across cpu nodes for NODE-level HA when
+      # more than one exists; preferred so both still fit on <CPU_NODE> today.
+      affinity:
+        podAntiAffinity:
+          # REQUIRED, not preferred: the router is the registration tracker, so
+          # both replicas on one CPU node is a SPOF. With 3 CPU nodes and
+          # replicas=2 this forces a spread and never blocks scheduling.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app.kubernetes.io/name: infera}
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: infera-overlay
+          image: inferaimage/infera-overlay:v0.2.9
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp -a /payload/. /overlay/"]
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay}
+      containers:
+        - name: server
+          image: johnqin2025/kimi-k3-dspark:1.1.0-mi355x-rocm7.2.3-20260802
+          imagePullPolicy: IfNotPresent
+          command:
+            - /overlay/bin/infera-exec
+            - python3
+            - -m
+            - infera.server
+            - --host
+            - "<IP>"
+            - --port
+            - "8000"
+            # HF REPO ID, not a local path. A hostPath mount here was a real bug:
+            # /mnt/nvme only exists on the GPU node, and this pod is pinned to the
+            # CPU node, so the mount failed with "is not a directory" and the pod
+            # never left PodInitializing. AMD's recipe avoids this by pinning
+            # server and worker to the SAME node; we deliberately do not, because
+            # the router belongs on the CPU node. Fetching the tokenizer from the
+            # Hub instead is a few MB, needs no token (the repo is public), and
+            # keeps the router free of any dependency on GPU-node storage.
+            # Do NOT set HF_HUB_OFFLINE on this pod.
+            - --router-tokenizer-path
+            - moonshotai/Kimi-K3
+            - --discovery-backend
+            - kubernetes
+            - --k8s-label-selector
+            - app.kubernetes.io/name=kimi-k3-infera
+            - --request-transport
+            - http
+            - --kv-event-transport
+            - zmq
+            # round-robin, not kv-aware. With ONE worker the policy is moot, and
+            # kv-aware measurably degenerated to a single target on the old
+            # image (request_blocks=0, batches_received=0). Retest kv-aware only
+            # when there are 2+ workers to differentiate.
+            - --router-policy
+            - round-robin
+            # Cost function is:  w * (request_blocks - hits) + active_blocks
+            # Lower w favours LOAD BALANCE, higher favours cache reuse.
+            # Only consulted when --router-policy is kv-aware.
+            - --kv-overlap-weight
+            - "1.0"
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            # NO CPU LIMIT, deliberately. A 16-core limit was throttling this
+            # container: cgroup cpu.stat showed nr_throttled=130 and
+            # throttled_usec=473,597,126 across a 40-minute run, and the engine
+            # log shows the matching symptom -- run dropping 46 -> 1 with
+            # wait=0 throughout, i.e. the engine STARVED because requests never
+            # reached it, while ~26 client requests each waited ~68s.
+            #
+            # The router tokenizes every prompt for prefix hashing (Phase B alone
+            # pushed ~17M tokens through it in 20 min), so it is genuinely
+            # CPU-hungry and bursty. CFS quota throttling on a latency-sensitive
+            # component converts a burst into a multi-second stall.
+            #
+            # requests: 8 still reserves capacity for the scheduler. <CPU_NODE>
+            # has 64 vCPU running only this, the gateway (limit 4), Traefik and
+            # coredns, so uncapped CPU here cannot starve anything.
+            requests: {cpu: "8", memory: 16Gi}
+            limits: {memory: 32Gi}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay, readOnly: true}
+      volumes:
+        - name: overlay
+          emptyDir: {}
+---
+# Worker Service. NOT for serving traffic (the router reaches workers directly
+# over pod networking via kubernetes discovery), but the gateway's layer-2
+# admission polls the vLLM metrics dialect, and svc/infera exposes the ROUTER's
+# metrics, which are a different shape. This gives the gateway a stable name for
+# the engine's own /metrics.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kimi-k3-infera
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kimi-k3-infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  # TWO replicas as of 2026-08-04: humble-macaw joined the cluster with 8 GPUs
+  # and the Kimi-K3 weights staged locally (1.5TB, 96 shards). Each replica is
+  # TP8 and consumes a whole node, so 2 replicas = both GPU nodes.
+  #
+  # Aggregated, NOT prefill/decode disaggregation. PD WAS DEPLOYED AND ROLLED
+  # BACK on 2026-08-05 -- see PD-ATTEMPT-2026-08-05.md. The RoCE fabric is fine
+  # (37 GB/s node-to-node, host memory, measured). What blocks PD is GPU-direct
+  # RDMA: ibv_reg_mr on VRAM fails because no peer-memory kernel module
+  # (amdp2p / ib_peer_mem) is loaded on either node, so Mooncake cannot move KV
+  # between GPU memories and the request hangs forever.
+  # DaemonSet: one TP8 worker per gpu-worker node, automatically. No replicas
+  # to manage — the labeled-node set IS the worker set. A node joining with the
+  # gpu-worker label schedules a worker (which stages weights then self-
+  # registers with the router); unlabeling or removing it deletes the worker
+  # and the router drops it on its next re-list. This is the automatic
+  # register / fall-out behavior.
+  updateStrategy:
+    # One node at a time: each rollout pays the ~10-14 min cold start, and both
+    # nodes are fully GPU-allocated so there is no surge room regardless.
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kimi-k3-infera
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kimi-k3-infera
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      # Workers patch their own Pod annotation to register with the router.
+      serviceAccountName: kimi-k3-serving
+      tolerations:
+        - {key: amd.com/gpu, operator: Equal, value: present, effect: NoSchedule}
+      nodeSelector:
+        node-role.kubernetes.io/gpu-worker: ""
+      # 180, not 60: must cover the 20s preStop drain PLUS however long an
+      # already-admitted request needs to finish. Our measured p99 round-trip is
+      # ~100s, so 60s would SIGKILL mid-response on the slow tail.
+      terminationGracePeriodSeconds: 180
+      initContainers:
+        # Self-provision weights so a freshly-joined node stages its own 1.5TB
+        # instead of crash-looping on an empty /mnt/nvme. Idempotent: if the 96
+        # shards are already present it exits in seconds; it only runs hf
+        # download when they are missing (new nodes, ~18 min via Xet). This is
+        # what makes "add a node" fully automatic — no manual weight Job.
+        - name: stage-weights
+          image: python:3.12-slim
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              W=/weights
+              # Guard on BOTH models this initContainer is responsible for: the
+              # 96 main-model shards AND the DSpark draft. Checking only Kimi-K3
+              # would skip staging on a node that has the main model but a
+              # missing/corrupt draft, starving a spec-decode engine.
+              if [ "$(ls "$W"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)" -ge 96 ] \
+                 && [ -f "$W"/Kimi-K3-DSpark/config.json ]; then
+                echo "[stage] main model + DSpark draft present — skipping"; exit 0
+              fi
+              echo "[stage] weights missing/incomplete — staging ~1.5TB"
+              pip install --quiet --no-cache-dir 'huggingface_hub[cli]' hf_xet
+              export HF_XET_HIGH_PERFORMANCE=1
+              hf download Inferact/Kimi-K3-DSpark --local-dir "$W"/Kimi-K3-DSpark
+              hf download moonshotai/Kimi-K3      --local-dir "$W"/Kimi-K3
+              echo "[stage] done: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+          volumeMounts:
+            - {name: model, mountPath: /weights}
+        - name: infera-overlay
+          image: inferaimage/infera-overlay:v0.2.9
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp -a /payload/. /overlay/"]
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay}
+      containers:
+        - name: main
+          image: johnqin2025/kimi-k3-dspark:1.1.0-mi355x-rocm7.2.3-20260802
+          imagePullPolicy: IfNotPresent
+          command:
+            - /overlay/bin/infera-exec
+            - python3
+            - -m
+            - infera.engine.vllm
+            - --host
+            - "<IP>"
+            - --port
+            - "8000"
+            - --model
+            - /models/Kimi-K3
+            - --served-model-name
+            - moonshotai/Kimi-K3
+            - --tensor-parallel-size
+            - "8"
+            - --trust-remote-code
+            - --load-format
+            - auto
+            - --mm-encoder-tp-mode
+            - data
+            - --kv-cache-dtype
+            - auto
+            # AMD's recipe value, NOT our previous 0.92. Their note: 0.95 dies
+            # with 998MB free trying to allocate 2.32GiB, because draft weights
+            # land after the KV budget is computed.
+            - --gpu-memory-utilization
+            - "0.92"
+            - --max-num-seqs
+            - "64"
+            # AMD use 4096. Ours was 8192. Lower caps prefill tokens per
+            # scheduling step, which protects decode latency at the cost of
+            # prefill throughput. Taking their value since this is their
+            # validated config; revisit once measured.
+            - --max-num-batched-tokens
+            - "8192"
+            # 1048576 (1M), MATCHING AMD's recipe and the entire OpenRouter field.
+            #
+            # Every other kimi-k3 provider on OpenRouter (Fireworks, Baseten,
+            # Together, Modal, DigitalOcean, Moonshot themselves) advertises
+            # 1,048,576. Shipping 65536 against that is a visible listing
+            # disadvantage on a page buyers compare side by side.
+            #
+            # The old justification does NOT survive scrutiny: the July
+            # measurement that "proved" a smaller context was faster changed
+            # --max-model-len AND prefix caching in the SAME run, so the
+            # contribution of context length alone was never isolated. And
+            # max-model-len is a CAP, not consumption, so short requests should
+            # not pay for it. AMD run 1M and report 48.81ms TPOT at c=64.
+            #
+            # The real guard against 1M requests eating the box is the gateway's
+            # token_budget admission, not a low cap: profiles/kimi-k3-vllm sets
+            # token_budget from the measured KV cache, so a handful of true 1M
+            # requests get admitted and the rest get an immediate 429. That is
+            # the design working as intended rather than a cap papering over it.
+            - --max-model-len
+            - "1048576"
+            # ON, and this is now a REQUIREMENT not a preference: KV-cache
+            # tiering (26-kvd-tiering.yaml) has nothing to retain without it, and
+            # the engine logs "KV cache events are on, but prefix caching is not
+            # enabled" when it is off.
+            #
+            # It costs 21-27% on a NO-REUSE benchmark (718 -> 569 tok/s at c=64)
+            # because K3 is a Mamba hybrid and prefix caching forces an
+            # experimental 'align' mode. That penalty is measured on random
+            # prompts with zero shared prefix, which is exactly the case where
+            # caching is pure overhead. On the agentic traffic Infera targets
+            # (100:1 input:output, repeated system prompts and tool context) the
+            # sign should invert. Re-measure on a reuse workload before drawing
+            # any conclusion from throughput alone.
+            #
+            # pricing.input_cache_read MUST stay "0" until a repeated-prefix
+            # output diff confirms identical results both ways.
+            - --enable-prefix-caching
+            # KVD TIERING REMOVED. Verified impossible for Kimi-K3, not merely
+            # misconfigured. The engine says so explicitly:
+            #   kvd: hybrid (Mamba/linear-attention) model detected — external L3
+            #   LOAD disabled (vLLM does not support external KV-connector loads
+            #   for hybrid models); attention-only saves continue but will not be
+            #   reused
+            # Metrics confirmed the asymmetry: saved_chunks>0, saved_MiB=141.8,
+            # loaded_chunks=0, l3_hit_rate=0.0. We were writing 142 MiB chunks to
+            # a cache that can never be read, and paying for it: cold TTFT went
+            # 3.77s -> 24.58s with saves active.
+            # 26-kvd-tiering.yaml is KEPT: it is correct, and it would work for a
+            # non-hybrid model (Qwen, Llama). It is K3 that cannot use it.
+            # Keep both parsers: --reasoning-parser is a listing blocker, without
+            # it K3 writes chain of thought into message.content.
+            - --reasoning-parser
+            - kimi_k3
+            - --enable-auto-tool-choice
+            - --tool-call-parser
+            - kimi_k3
+            - --request-transport
+            - http
+            - --kv-event-transport
+            - zmq
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            # --- AMD's optimized-image env block, verbatim from their recipe ---
+            - {name: VLLM_ROCM_USE_AITER, value: "1"}
+            - {name: VLLM_ROCM_USE_AITER_FP4BMM, value: "1"}
+            - {name: AITER_SITUV2_A8W4, value: "1"}
+            - {name: AITER_BF16_FP8_MOE_BOUND, value: "0"}
+            - {name: HIP_FORCE_DEV_KERNARG, value: "1"}
+            - {name: HSA_NO_SCRATCH_RECLAIM, value: "1"}
+            - {name: HSA_ENABLE_IPC_MODE_LEGACY, value: "1"}
+            - {name: SAFETENSORS_FAST_GPU, value: "1"}
+            - {name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "0"}
+            - {name: VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION, value: "1"}
+            # THE KEY CHANGE. We currently run this as "1". AMD are explicit that
+            # a 1 makes the pre-route dispatch take BF16 and shadows the FP8
+            # kernel cluster this image exists for, costing a large fraction of
+            # throughput. It is SILENT: the worker starts, logs no warning, and
+            # median per-token latency barely moves. Only aggregate throughput
+            # shows it. This is the suspected source of the 35% TPOT gap
+            # (ours 75.0ms vs their 48.81ms at c=64).
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_BF16, value: "0"}
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8, value: "1"}
+            - {name: VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8, value: "1"}
+            - {name: KIMI_K3_DUAL_PROJ_FP8_WEIGHT_CACHE_MODIFIER, value: "2"}
+            - {name: KIMI_K3_SHARED_DOWN_FP8_WEIGHT_CACHE_MODIFIER, value: "2"}
+            # 1800s default is impossible on slow storage and the worker then
+            # restarts mid-load forever, which reads as a crash loop. Our weights
+            # are on local NVMe (~8 min) but there is no reason to be tight.
+            - {name: INFERA_ENGINE_READY_TIMEOUT, value: "7200"}
+            - {name: HF_HUB_OFFLINE, value: "1"}
+            # Fixed seed: without it vLLM's NONE_HASH is random per restart,
+            # which makes cross-restart prefix hits impossible.
+            - {name: PYTHONHASHSEED, value: "0"}
+            - {name: VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES, value: "1"}
+            # NOTE ON WHAT IS *NOT* HERE. Everything kvd-related was removed after
+            # AMD's own recipe README turned out to say, in its validation table:
+            #     | kvd combinations | not built for this image |
+            # and the engine confirmed the mechanism: "hybrid (Mamba/linear-
+            # attention) model detected — external L3 LOAD disabled". We had also
+            # inherited VLLM_RPC_TIMEOUT and INFERA_KVD_CHUNK_TOKENS from
+            # bench/kvcache/.../launch_vllm_kvd_v2_kimi.sh, which targets
+            # Kimi-K2.5, NOT K3. Cross-applying a K2.5 script to K3 is what
+            # produced a silently no-op cache. Do not reintroduce without
+            # re-reading section 8 of the K3 recipe README.
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            requests:
+              amd.com/gpu: "8"
+              cpu: "32"
+              # Deliberately NO memory limit: loading 1.4TB of safetensors
+              # charges page cache to the cgroup and a limit OOM-kills mid-load.
+              memory: 1600Gi
+            limits:
+              amd.com/gpu: "8"
+              cpu: "200"
+          securityContext:
+            capabilities: {add: ["SYS_PTRACE"]}
+            seccompProfile: {type: Unconfined}
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay, readOnly: true}
+            - {name: model, mountPath: /models, readOnly: true}
+            - {name: dshm, mountPath: /dev/shm}
+          # GRACEFUL DRAIN. Without this, scale-in drops in-flight requests.
+          #
+          # Infera's router does NOT watch Kubernetes Endpoints; it POLLS the API
+          # and reads the infera.amd.com/worker-info annotation each worker
+          # patches onto itself. So when a pod is deleted, the router keeps
+          # dispatching to it until its next re-list. SIGTERM meanwhile makes vLLM
+          # begin shutting down immediately, so requests dispatched in that window
+          # are lost.
+          #
+          # preStop runs BEFORE SIGTERM and blocks termination for its duration.
+          # Sleeping 20s gives the router time to re-list and stop routing here,
+          # while requests already in flight keep being served by the still-healthy
+          # engine. terminationGracePeriodSeconds must exceed preStop + the time a
+          # long request needs to finish, hence 180 below (was 60).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 20"]
+          startupProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 15
+            timeoutSeconds: 10
+            # 400 x 15s = 100 min. A false give-up costs another full reload,
+            # and the image rebuilds AITER JIT modules in-container on first
+            # start on top of weight load and graph capture (AMD: 10-14 min).
+            failureThreshold: 400
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+            timeoutSeconds: 10
+      volumes:
+        - name: overlay
+          emptyDir: {}
+        - name: model
+          # DirectoryOrCreate (not Directory): a freshly-joined node has no
+          # weights dir yet; the stage-weights initContainer creates+populates
+          # it. On existing nodes it already exists and is reused.
+          hostPath: {path: /mnt/nvme/kimi-k3/weights, type: DirectoryOrCreate}
+        - name: dshm
+          # TP8 workers coordinate over shared memory; the 64MB default is far
+          # too small and produces obscure RCCL failures.
+          emptyDir: {medium: Memory, sizeLimit: 32Gi}

@@ -1,0 +1,105 @@
+# Stage the Kimi-K3 checkpoint (~1.5 TB) + the DSpark draft onto a GPU node's
+# local NVMe, as a Job.
+#
+# STORAGE: hostPath on the NVMe (/mnt/nvme/kimi-k3/weights), NOT a
+# PersistentVolumeClaim. On these clusters the default `local-path`
+# StorageClass typically writes to the node's small ROOT disk, so a PVC will
+# report whatever size you ask for and then fill the root filesystem partway
+# through a 1.5 TB pull. hostPath onto the real NVMe array avoids that (and
+# local-path is node-pinned RWO anyway, so nothing is lost). See docs/06-traps.md.
+#
+# Run as a Job (not an initContainer): the pull takes hours and `hf download`
+# resumes, so a failed Job just retries; an initContainer would restart from
+# scratch on every reschedule. The free-space guard refuses to start unless
+# ~1700 GB is free, so it cannot silently fill a node.
+#
+# The serving pod (aggregated DaemonSet or the PD InferaDeployment) must use the
+# SAME node + the SAME hostPath. Repeat per GPU node (the DaemonSet path can
+# instead self-stage on join; PD expects the weights already present).
+#
+# TARGET_REPO / DRAFT_REPO are public Hugging Face repos. Set node-role labels
+# to match your cluster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-weights-download
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      restartPolicy: OnFailure
+      # GPU nodes carry amd.com/gpu=present:NoSchedule. No GPU is needed here,
+      # but the weights must land on the node that will serve them.
+      tolerations:
+        - key: amd.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+      # By role, not hostname. your cluster has exactly one GPU node
+      # (<GPU_NODE>) and node names here are generated, so pinning by
+      # hostname is both fragile and unnecessary.
+      nodeSelector:
+        node-role.kubernetes.io/gpu-worker: ""
+      containers:
+        - name: download
+          image: python:3.12-slim
+          env:
+            # hf_transfer is deprecated in current huggingface_hub; Xet high
+            # performance mode is the replacement.
+            - name: HF_XET_HIGH_PERFORMANCE
+              value: "1"
+            - name: TARGET_REPO
+              value: moonshotai/Kimi-K3
+            - name: DRAFT_REPO
+              value: Inferact/Kimi-K3-DSpark
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              echo "[download] target filesystem:"
+              df -h /weights | tail -1
+              AVAIL_GB=$(df -BG --output=avail /weights | tail -1 | tr -dc '0-9')
+              if [ "$AVAIL_GB" -lt 1700 ]; then
+                echo "[download] FATAL: only ${AVAIL_GB}GB free, need ~1700GB." >&2
+                echo "[download] Refusing to start: this is the check that stops us" >&2
+                echo "[download] filling a node filesystem again." >&2
+                exit 1
+              fi
+              echo "[download] ${AVAIL_GB}GB available, proceeding"
+
+              pip install --quiet --no-cache-dir 'huggingface_hub[cli]' hf_xet
+
+              echo "[download] ${DRAFT_REPO} (small, validates the path first)"
+              hf download "$DRAFT_REPO" --local-dir /weights/Kimi-K3-DSpark
+
+              echo "[download] ${TARGET_REPO} (~1.5TB, this is the long one)"
+              hf download "$TARGET_REPO" --local-dir /weights/Kimi-K3
+
+              echo "[download] done:"
+              du -sh /weights/Kimi-K3 /weights/Kimi-K3-DSpark || true
+              echo "[download] safetensors shards: $(ls /weights/Kimi-K3/*.safetensors 2>/dev/null | wc -l)"
+              df -h /weights | tail -1
+          resources:
+            requests:
+              cpu: "16"
+              memory: 32Gi
+            limits:
+              cpu: "32"
+              memory: 64Gi
+          volumeMounts:
+            - name: weights
+              mountPath: /weights
+      volumes:
+        - name: weights
+          hostPath:
+            # /dev/md0, 27.9T NVMe RAID with ~27T free.
+            path: /mnt/nvme/kimi-k3/weights
+            type: DirectoryOrCreate

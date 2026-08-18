@@ -1,0 +1,17 @@
+# benchmark outputs
+*.csv
+orbench.csv
+run*.csv
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# never commit secrets, keys, or kubeconfigs
+*.key
+*.pem
+kubeconfig*
+*secret*.yaml
+.env
