@@ -163,10 +163,17 @@ kubectl logs -f job/kimi-k3-loadtest
 ConfigMap): open-loop Poisson arrivals across the realistic mix, sweeping
 0.5, 1, 2 and 4 req/s by default (edit the `RATES`/`SECS`/`WARM`/`DRAIN`
 env in the file), about 17 minutes. Read the operating point off the
-rate-vs-stats table as docs/05 describes. The per-request CSV lands under
-`/mnt/shared/kimi-k3/loadtest/` on the volume. The Job waits for the router
-to list the model before offering load, and removes itself ten minutes
-after it finishes.
+rate-vs-stats table as docs/05 describes. The Job offers no load until every
+worker is Ready and discovered by the router (it prints `workers ready: N/M`
+every 30 s while waiting). The results outlive it: the full output lands at
+`/mnt/shared/kimi-k3/loadtest/orbench-<time>.log` with the per-request CSV
+beside it and `latest.log` pointing at the newest run; the Job stays an hour
+after it finishes. Read a run any time:
+
+```bash
+kubectl apply -f k8s/market/loadtest-results.yaml    # RUN=latest, or a listed timestamp
+kubectl logs -f job/kimi-k3-loadtest-results
+```
 
 ### 7. Scale, or stop paying
 

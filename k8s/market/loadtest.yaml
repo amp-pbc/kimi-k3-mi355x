@@ -21,10 +21,13 @@
 #
 # Defaults sweep 0.5, 1, 2 and 4 req/s, 120 s each after a 60 s warm-up,
 # 120 s drain between rates: about 17 minutes. Change the env values below
-# to sweep other rates. Every request also lands in a CSV on the shared
-# volume (/mnt/shared/kimi-k3/loadtest/) when the cluster has one. The Job
-# removes itself ten minutes after it finishes; while it exists, delete it
-# before applying it again (a Job's pod template is immutable).
+# The RESULTS OUTLIVE THIS JOB on clusters with a shared volume: the full
+# console output lands at /mnt/shared/kimi-k3/loadtest/orbench-<time>.log
+# with the per-request CSV beside it, and latest.log / latest.csv point at
+# the newest run. The Job itself stays for an hour after it finishes (its
+# pod's log with it); after that, or any time, read a run with the results
+# reader Job (k8s/market/loadtest-results.yaml). To run the test again while the Job
+# still exists, delete it first (a Job's pod template is immutable).
 #
 # Same file as the National Compute Getting Started
 # first-job/kimi-k3-loadtest.yaml; keep the two in step.
@@ -432,7 +435,9 @@ metadata:
     app.kubernetes.io/part-of: kimi-k3
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 600
+  # an hour to read the pod's log after the run; the results on the shared
+  # volume stay regardless (see the header)
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
@@ -466,6 +471,8 @@ spec:
             - {name: DRAIN, value: "120"}
             # how long to wait for the deployment to come up before giving up
             - {name: WAIT_MAX, value: "5400"}
+            # how to read a finished run's results later (printed at the end)
+            - {name: RESULTS_READER, value: "kubectl apply -f k8s/market/loadtest-results.yaml && kubectl logs -f job/kimi-k3-loadtest-results"}
           command:
             - bash
             - -euo
@@ -483,15 +490,30 @@ spec:
                 sleep 30
               done
               echo "[loadtest] deployment up after $(( $(date +%s) - T0 )) s"
-              # per-request CSV: the shared volume when this cluster has one
-              # (a real mount at /shared), else the pod's /tmp (gone with it)
-              CSV=/tmp/orbench.csv
+              # results: on the shared volume when this cluster has one (a real
+              # mount at /shared) — the per-request CSV, the full console output
+              # as a .log, and latest.* pointing at this run — so they outlive
+              # this Job; else the pod's /tmp (gone with it)
+              OUT=/tmp; ON_VOLUME=0
               if grep -q " /shared " /proc/mounts; then
-                mkdir -p /shared/kimi-k3/loadtest
-                CSV=/shared/kimi-k3/loadtest/orbench-$(date -u +%Y%m%dT%H%M%SZ).csv
+                OUT=/shared/kimi-k3/loadtest; mkdir -p "$OUT"; ON_VOLUME=1
               fi
-              echo "[loadtest] rates $RATES req/s · $SECS s each · warm $WARM s · drain $DRAIN s · csv $CSV"
-              exec python3 /bench/orbench.py --rates "$RATES" --secs "$SECS" --warm "$WARM" --drain "$DRAIN" --csv "$CSV"
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              CSV="$OUT/orbench-$TS.csv"; LOG="$OUT/orbench-$TS.log"
+              echo "[loadtest] rates $RATES req/s · $SECS s each · warm $WARM s · drain $DRAIN s · results $OUT/orbench-$TS.log and .csv"
+              set +e
+              python3 -u /bench/orbench.py --rates "$RATES" --secs "$SECS" --warm "$WARM" --drain "$DRAIN" --csv "$CSV" 2>&1 | tee "$LOG"
+              RC=${PIPESTATUS[0]}
+              set -e
+              if [ "$ON_VOLUME" = 1 ]; then
+                cp -f "$LOG" "$OUT/latest.log"
+                cp -f "$CSV" "$OUT/latest.csv" 2>/dev/null || true
+                echo "[loadtest] results saved on the shared volume: $LOG (and .csv); latest.log / latest.csv point at this run."
+                echo "[loadtest] read them any time, after this Job is gone too: $RESULTS_READER"
+              else
+                echo "[loadtest] no shared volume on this cluster: the results live in this pod's log until the Job is removed"
+              fi
+              exit "$RC"
           resources:
             requests: {cpu: "2", memory: 4Gi}
             limits: {memory: 16Gi}
@@ -503,5 +525,5 @@ spec:
           configMap: {name: kimi-k3-loadtest}
         - name: shared
           # no type: a cluster without the volume still runs the test (the
-          # CSV then stays in the pod); the script checks for a real mount
+          # results then stay in the pod); the script checks for a real mount
           hostPath: {path: /mnt/shared}
