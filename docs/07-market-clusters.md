@@ -110,7 +110,7 @@ What you will see, per worker pod:
 | phase | reads as | typical |
 |---|---|---|
 | held by Kueue, market deciding, node provisioning | `Pending` (SchedulingGated) | 10–15 min |
-| image pull + weight copy from the volume | `Init:0/2`, `Init:1/2` | 5 min + copy time (network-bound) |
+| image pull + weight copy from the volume | `Init:0/2`, `Init:1/2` | 5 min + about 2 min (32 parallel streams read the export at ~14 GB/s; one stream took 45 min) |
 | engine load, graph capture | `Running` `0/1` | 10–14 min |
 | serving | `Running` `1/1` | |
 
