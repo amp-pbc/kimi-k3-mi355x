@@ -124,6 +124,10 @@ class Bench:
         self.f.flush()
 
     def add(self, **kw):
+        if self.f.closed:
+            # a request that outlived the last drain finishes after main()
+            # closed the CSV: nothing to record, never a traceback
+            return
         self.rows.append(kw)
         self.w.writerow([f"{kw['ts']:.3f}", kw["rate"], kw["slice"], kw["session"], kw["turn"],
                          kw["status"], "" if kw["ttft_s"] is None else f"{kw['ttft_s']:.3f}",

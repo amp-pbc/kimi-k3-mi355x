@@ -11,10 +11,13 @@
 #   kubectl logs -f job/kimi-k3-loadtest
 #
 # Hits http://infera:8000 over the pod network — never through a
-# port-forward (bench/README.md). Waits for the endpoint to list the model
-# (a PD router serves once one prefill and one decode worker are up), then
-# sweeps the rates below. Apply it once every worker reads READY 1/1, or the
-# numbers describe a partially built deployment.
+# port-forward (bench/README.md). Offers no load until the deployment is
+# FULLY up: every worker pod Ready (Kubernetes API, the recipe's
+# kimi-k3-serving ServiceAccount) and discovered by the router (/v1/workers),
+# both roles present for PD — the router answers 503 until one prefill and
+# one decode worker are up, and a test that starts before the last worker
+# measures a smaller deployment than you paid for. Prints "workers ready:
+# N/M" every 30 s while waiting.
 #
 # Defaults sweep 0.5, 1, 2 and 4 req/s, 120 s each after a 60 s warm-up,
 # 120 s drain between rates: about 17 minutes. Change the env values below
@@ -160,6 +163,10 @@ data:
             self.f.flush()
 
         def add(self, **kw):
+            if self.f.closed:
+                # a request that outlived the last drain finishes after main()
+                # closed the CSV: nothing to record, never a traceback
+                return
             self.rows.append(kw)
             self.w.writerow([f"{kw['ts']:.3f}", kw["rate"], kw["slice"], kw["session"], kw["turn"],
                              kw["status"], "" if kw["ttft_s"] is None else f"{kw['ttft_s']:.3f}",
@@ -341,6 +348,79 @@ data:
         bench.f.close()
 
     asyncio.run(main())
+  wait_ready.py: |
+    """Exit 0 when the serving deployment is fully up, 1 otherwise, one status
+    line either way. Fully up = every worker pod is Ready (the Kubernetes API,
+    read with this Job's ServiceAccount — the recipe's kimi-k3-serving, which
+    may list pods) AND the router lists at least as many active workers on its
+    /v1/workers AND, for a prefill/decode deployment, both roles are present.
+    When the API is not reachable (no token, RBAC) the router's view alone
+    decides. EXPECT_WORKERS (env) adds a floor on the router's active count.
+    Why: a load test that starts while a role is missing measures 503s (the
+    router refuses every request until one prefill and one decode worker are
+    up), and one that starts before the last worker measures a smaller
+    deployment than the one you paid for."""
+    import os
+    import sys
+
+    import httpx
+
+    ROUTER = sys.argv[1]
+    LABEL = os.environ.get("WORKER_LABEL", "app.kubernetes.io/name=kimi-k3-infera")
+    EXPECT = int(os.environ.get("EXPECT_WORKERS") or 0)
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def pods():
+        """(ready, total) over the worker pods, or None when the API is out of
+        reach for this Job."""
+        try:
+            tok = open(f"{SA}/token").read().strip()
+            ns = open(f"{SA}/namespace").read().strip()
+            r = httpx.get(f"https://kubernetes.default.svc/api/v1/namespaces/{ns}/pods",
+                          params={"labelSelector": LABEL},
+                          headers={"Authorization": f"Bearer {tok}"},
+                          verify=f"{SA}/ca.crt", timeout=10)
+            if r.status_code != 200:
+                return None
+            items = r.json().get("items") or []
+            ready = sum(1 for p in items
+                        if any(c.get("type") == "Ready" and c.get("status") == "True"
+                               for c in (p.get("status") or {}).get("conditions") or []))
+            return ready, len(items)
+        except Exception:
+            return None
+
+
+    def workers():
+        try:
+            r = httpx.get(f"{ROUTER}/v1/workers", timeout=10)
+            if r.status_code != 200:
+                return []
+            return [w for w in (r.json().get("workers") or [])
+                    if str(w.get("status") or "").lower() == "active"]
+        except Exception:
+            return []
+
+
+    w = workers()
+    modes = [str(x.get("disagg_mode") or "").upper() for x in w]
+    pd = any("PREFILL" in m or "DECODE" in m for m in modes)
+    roles_ok = (not pd) or (any("PREFILL" in m for m in modes)
+                            and any("DECODE" in m for m in modes))
+    p = pods()
+    if p is None:
+        ok = bool(w) and roles_ok and len(w) >= EXPECT
+        print(f"[loadtest] router sees {len(w)} active worker(s), roles complete: "
+              f"{'yes' if roles_ok else 'no'} (worker pods not visible to this Job)",
+              flush=True)
+    else:
+        ready, total = p
+        ok = (total >= 1 and ready == total and len(w) >= total
+              and roles_ok and len(w) >= EXPECT)
+        print(f"[loadtest] workers ready: {ready}/{total} · router sees {len(w)} "
+              f"active · roles complete: {'yes' if roles_ok else 'no'}", flush=True)
+    sys.exit(0 if ok else 1)
 ---
 apiVersion: batch/v1
 kind: Job
@@ -360,6 +440,9 @@ spec:
         app.kubernetes.io/part-of: kimi-k3
     spec:
       restartPolicy: Never
+      # the serving recipe's ServiceAccount (it may list pods): how the
+      # readiness wait sees the worker pods. Apply the serving manifest first.
+      serviceAccountName: kimi-k3-serving
       # CPU worker only: no GPU request, no GPU toleration. Present from the
       # cluster's first minute, and next to the router.
       nodeSelector:
@@ -371,14 +454,18 @@ spec:
             # the router's OpenAI-compatible endpoint, in-cluster
             - {name: ORBENCH_BASE, value: "http://infera:8000/v1/chat/completions"}
             - {name: ORBENCH_MODEL, value: "moonshotai/Kimi-K3"}
+            # the worker pods the readiness wait counts (both recipes' label);
+            # EXPECT_WORKERS adds a floor on the router's active count ("" = off)
+            - {name: WORKER_LABEL, value: "app.kubernetes.io/name=kimi-k3-infera"}
+            - {name: EXPECT_WORKERS, value: ""}
             # the sweep: offered request rates (req/s), seconds per rate,
             # warm-up seconds (discarded), drain seconds between rates
             - {name: RATES, value: "0.5,1,2,4"}
             - {name: SECS, value: "120"}
             - {name: WARM, value: "60"}
             - {name: DRAIN, value: "120"}
-            # how long to wait for the endpoint to serve before giving up
-            - {name: WAIT_MAX, value: "3600"}
+            # how long to wait for the deployment to come up before giving up
+            - {name: WAIT_MAX, value: "5400"}
           command:
             - bash
             - -euo
@@ -386,18 +473,16 @@ spec:
             - -c
             - |
               pip install --quiet --no-cache-dir 'httpx>=0.27'
-              MODELS="${ORBENCH_BASE%/v1/*}/v1/models"
-              echo "[loadtest] waiting for $MODELS to list $ORBENCH_MODEL (up to $WAIT_MAX s)"
+              ROUTER="${ORBENCH_BASE%/v1/*}"
+              echo "[loadtest] waiting for every worker to be ready and discovered by the router at $ROUTER (up to $WAIT_MAX s)"
               T0=$(date +%s)
-              until python3 -c 'import os, sys, httpx
-              r = httpx.get(sys.argv[1], timeout=10)
-              sys.exit(0 if r.status_code == 200 and os.environ["ORBENCH_MODEL"] in r.text else 1)' "$MODELS" 2>/dev/null; do
+              until python3 /bench/wait_ready.py "$ROUTER"; do
                 if [ $(( $(date +%s) - T0 )) -ge "$WAIT_MAX" ]; then
-                  echo "[loadtest] the endpoint did not serve $ORBENCH_MODEL within $WAIT_MAX s"; exit 3
+                  echo "[loadtest] the deployment did not come up within $WAIT_MAX s"; exit 3
                 fi
-                sleep 15
+                sleep 30
               done
-              echo "[loadtest] endpoint up after $(( $(date +%s) - T0 )) s"
+              echo "[loadtest] deployment up after $(( $(date +%s) - T0 )) s"
               # per-request CSV: the shared volume when this cluster has one
               # (a real mount at /shared), else the pod's /tmp (gone with it)
               CSV=/tmp/orbench.csv
