@@ -152,7 +152,23 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
-### 6. Scale, or stop paying
+### 6. Load test, from inside the cluster
+
+```bash
+kubectl apply -f k8s/market/loadtest.yaml     # once every worker reads READY 1/1
+kubectl logs -f job/kimi-k3-loadtest
+```
+
+`bench/orbench.py` as a Job on the CPU worker (the script rides in a
+ConfigMap): open-loop Poisson arrivals across the realistic mix, sweeping
+0.5, 1, 2 and 4 req/s by default (edit the `RATES`/`SECS`/`WARM`/`DRAIN`
+env in the file), about 17 minutes. Read the operating point off the
+rate-vs-stats table as docs/05 describes. The per-request CSV lands under
+`/mnt/shared/kimi-k3/loadtest/` on the volume. The Job waits for the router
+to list the model before offering load, and removes itself ten minutes
+after it finishes.
+
+### 7. Scale, or stop paying
 
 ```bash
 kubectl scale deploy/kimi-k3-prefill --replicas=5     # each replica buys a node
