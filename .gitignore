@@ -15,3 +15,13 @@ venv/
 kubeconfig*
 *secret*.yaml
 .env
+
+# Model artifacts are downloaded from upstream, not distributed by this repo.
+/weights/
+/models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.ckpt
+pytorch_model*.bin

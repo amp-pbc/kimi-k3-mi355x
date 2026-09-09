@@ -5,6 +5,8 @@
 # round-robin. This is the simplest, most robust baseline: no host RDMA prep,
 # no Mooncake, no prefill/decode split. Use it when you have < 3 GPU nodes or
 # don't need PD. See docs/02-serving-aggregated.md.
+# Model licenses are separate from this repo's Apache-2.0 license; see
+# THIRD_PARTY_NOTICES.md. Keep each upstream LICENSE with its model files.
 #
 # The workers are a DaemonSet: one lands on every node labelled
 # node-role.kubernetes.io/gpu-worker="", self-stages weights on join, and
@@ -265,12 +267,22 @@ spec:
             - -c
             - |
               W=/weights
+              require_model_licenses() {
+                for model_dir in "$W"/Kimi-K3 "$W"/Kimi-K3-DSpark; do
+                  if [ ! -s "$model_dir/LICENSE" ]; then
+                    echo "[stage] FATAL: missing model license: $model_dir/LICENSE" >&2
+                    echo "[stage] Restore the LICENSE from the model's exact upstream revision." >&2
+                    exit 1
+                  fi
+                done
+              }
               # Guard on BOTH models this initContainer is responsible for: the
               # 96 main-model shards AND the DSpark draft. Checking only Kimi-K3
               # would skip staging on a node that has the main model but a
               # missing/corrupt draft, starving a spec-decode engine.
               if [ "$(ls "$W"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)" -ge 96 ] \
                  && [ -f "$W"/Kimi-K3-DSpark/config.json ]; then
+                require_model_licenses
                 echo "[stage] main model + DSpark draft present — skipping"; exit 0
               fi
               echo "[stage] weights missing/incomplete — staging ~1.5TB"
@@ -278,6 +290,7 @@ spec:
               export HF_XET_HIGH_PERFORMANCE=1
               hf download Inferact/Kimi-K3-DSpark --local-dir "$W"/Kimi-K3-DSpark
               hf download moonshotai/Kimi-K3      --local-dir "$W"/Kimi-K3
+              require_model_licenses
               echo "[stage] done: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
           volumeMounts:
             - {name: model, mountPath: /weights}
