@@ -41,15 +41,50 @@ docs/
   04-verification.md       how to confirm PD is actually working (reliable gates)
   05-benchmarking.md       how to load-test and score it (OpenRouter-style view)
   06-traps.md              cluster traps that cost hours
+  07-market-clusters.md    market (dynamic) clusters: nodes are demand, weights on the volume
 k8s/
-  weights-stage-job.yaml   stage the ~1.5 TB checkpoint + DSpark draft to NVMe
-  aggregated/              self-contained aggregated serving (DaemonSet + router)
-  pd-dspark/               the InferaDeployment CR for PD + DSpark
+  weights-stage-job.yaml   stage the ~1.5 TB checkpoint + DSpark draft to NVMe (static clusters)
+  aggregated/              self-contained aggregated serving (DaemonSet + router; static clusters)
+  pd-dspark/               the InferaDeployment CR for PD + DSpark (static clusters)
+  market/                  the same two modes for market (dynamic) clusters: Deployments,
+                           weights staged once on the shared volume, no operator
 bench/
   orbench.py               open-loop, mixed-traffic load generator
 ```
 
-## Quickstart — aggregated
+## Which cluster kind?
+
+| | **Static cluster** | **Market (dynamic) cluster** |
+|---|---|---|
+| GPU nodes | exist, have names, keep their NVMe | join only while a workload asks, at your limit price; re-imaged when they leave |
+| Weights | staged per node onto NVMe (`k8s/weights-stage-job.yaml`) | staged **once** onto the cluster's shared volume; each worker copies to its node's NVMe |
+| Workers | DaemonSet (aggregated) / InferaDeployment CR (PD) | Deployments, one node per replica, no operator |
+| Start here | the two quickstarts below | [docs/07](docs/07-market-clusters.md) + `k8s/market/` |
+
+## Quickstart — market (dynamic) clusters
+
+Nodes arrive when a pod asks for 8 GPUs, so there is nothing to stage onto a
+node up front. Stage once onto the shared volume, then launch; see
+[docs/07](docs/07-market-clusters.md) for prerequisites (limit price, a 2 TiB
+shared volume, a Kueue pods-ready timeout that covers a cold start) and the
+six-node PD shape.
+
+```bash
+# 1) stage weights + the DSpark draft onto the shared volume (CPU worker, once)
+kubectl apply -f k8s/market/weights-to-shared.yaml
+
+# 2a) aggregated: one TP8 replica per node, `replicas` = nodes
+kubectl apply -f k8s/market/aggregated.yaml
+# 2b) or PD + DSpark: 4 prefill + 2 decode nodes behind the router
+kubectl apply -f k8s/market/pd-dspark.yaml
+
+# 3) smoke test through the router Service
+kubectl port-forward svc/infera 8000:8000 &
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+```
+
+## Quickstart — aggregated (static clusters)
 
 Review [model licensing](THIRD_PARTY_NOTICES.md) before downloading or serving.
 The model license has separate commercial-use conditions.
@@ -68,7 +103,7 @@ curl "$ENDPOINT/v1/chat/completions" -H "Authorization: Bearer $KEY" \
   -d '{"model":"moonshotai/kimi-k3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
-## Quickstart — PD + DSpark
+## Quickstart — PD + DSpark (static clusters)
 
 1. **Host prep first** — enable PeerDirect on every GPU node and fix the node
    IPs. PD silently hangs without it. See [docs/01](docs/01-host-prep.md) and

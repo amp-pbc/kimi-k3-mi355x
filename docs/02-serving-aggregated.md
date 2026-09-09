@@ -23,6 +23,10 @@ no KV-cache handoff, no RDMA fabric dependency, and no cross-node bootstrap.
 Adding capacity is just adding another labeled node; removing one drops a
 replica. The router load-balances across whatever replicas are registered.
 
+On a **market (dynamic) cluster** — GPU nodes join only while a workload asks
+for them — use `k8s/market/aggregated.yaml` instead of the DaemonSet here; see
+[07-market-clusters.md](07-market-clusters.md).
+
 ## When to use aggregated serving
 
 - **Fewer than 3 GPU nodes.** Prefill/decode disaggregation (PD) only pays off
