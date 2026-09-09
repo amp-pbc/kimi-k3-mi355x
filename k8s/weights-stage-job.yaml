@@ -1,5 +1,7 @@
 # Stage the Kimi-K3 checkpoint (~1.5 TB) + the DSpark draft onto a GPU node's
 # local NVMe, as a Job.
+# Model licenses are separate from this repo's Apache-2.0 license; see
+# THIRD_PARTY_NOTICES.md. Keep each upstream LICENSE with its model files.
 #
 # STORAGE: hostPath on the NVMe (/mnt/nvme/kimi-k3/weights), NOT a
 # PersistentVolumeClaim. On these clusters the default `local-path`
@@ -82,6 +84,15 @@ spec:
 
               echo "[download] ${TARGET_REPO} (~1.5TB, this is the long one)"
               hf download "$TARGET_REPO" --local-dir /weights/Kimi-K3
+
+              # Full downloads retain upstream notices. Do not filter them out.
+              for model_dir in /weights/Kimi-K3 /weights/Kimi-K3-DSpark; do
+                if [ ! -s "$model_dir/LICENSE" ]; then
+                  echo "[download] FATAL: missing model license: $model_dir/LICENSE" >&2
+                  echo "[download] Restore the LICENSE from the model's exact upstream revision." >&2
+                  exit 1
+                fi
+              done
 
               echo "[download] done:"
               du -sh /weights/Kimi-K3 /weights/Kimi-K3-DSpark || true

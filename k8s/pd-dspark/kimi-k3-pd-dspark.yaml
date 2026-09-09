@@ -1,5 +1,7 @@
 # Kimi-K3 — prefill/decode DISAGGREGATED (PD) + DSpark speculative decode
 # on AMD MI355X (8x per node), via the AMD Infera operator.
+# Model licenses are separate from this repo's Apache-2.0 license; see
+# THIRD_PARTY_NOTICES.md. Preserve both upstream LICENSE files when staging.
 #
 # This is a kind: InferaDeployment custom resource. The Infera operator
 # (Helm-installed into the `infera-system` namespace) reconciles it into a

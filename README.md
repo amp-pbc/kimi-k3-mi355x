@@ -51,6 +51,9 @@ bench/
 
 ## Quickstart — aggregated
 
+Review [model licensing](THIRD_PARTY_NOTICES.md) before downloading or serving.
+The model license has separate commercial-use conditions.
+
 ```bash
 # 1) stage weights onto each GPU node's NVMe (edit node labels / paths first)
 kubectl apply -f k8s/weights-stage-job.yaml
@@ -89,3 +92,16 @@ through `kubectl port-forward`. See [docs/05](docs/05-benchmarking.md).
 Built on AMD's Infera serving stack (Infera router + `infera.engine.vllm`),
 the Mooncake KV transfer engine, and DSpark speculative decoding. Kimi-K3 by
 Moonshot AI.
+
+## Licenses
+
+AMP PBC's recipes, documentation, and benchmark code are licensed under
+[Apache-2.0](LICENSE). This repository does not bundle model weights or
+container images, and Apache-2.0 does not license those external artifacts.
+
+The recipes download `moonshotai/Kimi-K3` and `Inferact/Kimi-K3-DSpark` from
+Hugging Face. Both publish the custom [Kimi K3 License](licenses/Kimi-K3-LICENSE.txt),
+including Moonshot AI's copyright notice and commercial-use conditions.
+Keep each model's upstream `LICENSE` with its weights and other model files.
+See [third-party notices and the licensing audit](THIRD_PARTY_NOTICES.md)
+for sources, redistribution requirements, and the commercial thresholds.
