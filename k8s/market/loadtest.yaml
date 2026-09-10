@@ -1,3 +1,11 @@
+# Routing/performance validation: this synthetic sweep is exploratory.
+# Sessions may overlap their own prior turn; drain timeout leaves requests
+# pending; an interrupted SSE stream may still be scored as successful.
+# For cache-aware comparisons use causal replay, complete-stream accounting,
+# one rate per process, and empty engine queues between arms. Record cache
+# warmth and per-worker counters; rerunning the Job does not clear caches.
+# See https://github.com/amp-pbc/kimi-k3-mi355x/blob/main/docs/08-kv-aware-routing.md
+#
 # Load test for a Kimi-K3 endpoint from INSIDE the cluster: bench/orbench.py
 # (methodology in docs/05) as a Job on the CPU worker, the script shipped
 # verbatim in a ConfigMap so nothing has to be copied onto a node. Offers the

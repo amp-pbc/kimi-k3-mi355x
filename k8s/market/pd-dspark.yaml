@@ -32,9 +32,11 @@
 #   5. The router runs on the CPU worker (no GPU request = not market demand,
 #      starts within a minute) and reads the tokenizer from the weights on
 #      the shared volume. It tokenizes every request to route it by
-#      prefix-cache locality and least load; without a working tokenizer
-#      every worker ties and ALL traffic lands on the first worker of each
-#      role (2026-09-10: four of six nodes idle under a load test).
+#      prefix-cache locality and least load. The old overlay tied all workers
+#      at zero when tokenization failed; the v0.2.9 pin below fixes zero-block
+#      load accounting. A valid tokenizer is still required for cache affinity.
+#      Below the advertised block size (768 tokens in AMD's K3 setup), zero
+#      blocks are expected: test short-request balancing separately from reuse.
 #
 # Host prerequisites (docs/01, docs/06) are the PLATFORM's job on a market
 # cluster: GPU-direct RDMA (PeerDirect) is converged by the node image's
@@ -128,7 +130,7 @@ spec:
         node-role.kubernetes.io/cpu: ""
       initContainers:
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "cp -a /payload/. /overlay/"]
           volumeMounts:
@@ -152,7 +154,7 @@ spec:
             # with the Hub id the router fetched only tokenizer_config.json,
             # the load failed, every request hashed to ZERO blocks and the
             # kv-aware policy pinned all traffic on one prefill + one decode
-            # (2026-09-10). Same directory the engines load from.
+            # on the previous overlay. Same staged files the engines load from.
             - --router-tokenizer-path
             - /shared/kimi-k3/weights/Kimi-K3
             - --discovery-backend
@@ -165,13 +167,22 @@ spec:
             - http
             - --kv-event-transport
             - zmq
-            # Router policy: kv-aware (the default): cost = cache misses + load,
-            # both in token blocks, ties broken by least load. It NEEDS the
-            # tokenizer above. If the router logs "kv-aware: ... failed" and
-            # every "pick" line reads request_blocks=0, fall back to a
-            # stateless spread until the tokenizer loads:
-            #   - --router-policy
-            #   - round-robin
+            # Explicit baseline. Role weights override the global weight.
+            # After validating routing, compare prefill=20/decode=2 as a
+            # separate tuning arm. These are suggestions, not defaults.
+            - --router-backend
+            - python
+            - --router-policy
+            - kv-aware
+            - --kv-overlap-weight
+            - "1.0"
+            - --kv-prefill-overlap-weight
+            - "1.0"
+            - --kv-decode-overlap-weight
+            - "1.0"
+            # v0.2.9 charges load for zero-block requests (e.g. <768 tokens).
+            # Long prompts still require the complete tokenizer above and
+            # healthy KV events to gain cache affinity. See routing docs.
           env:
             - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
             - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
@@ -358,7 +369,7 @@ spec:
             - {name: model, mountPath: /weights}
             - {name: shared, mountPath: /shared, readOnly: true}
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh","-c","cp -a /payload/. /overlay/"]
           volumeMounts:
@@ -586,7 +597,7 @@ spec:
             - {name: model, mountPath: /weights}
             - {name: shared, mountPath: /shared, readOnly: true}
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh","-c","cp -a /payload/. /overlay/"]
           volumeMounts:

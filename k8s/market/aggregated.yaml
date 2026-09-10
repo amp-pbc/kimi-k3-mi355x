@@ -121,9 +121,12 @@ spec:
             - "0.0.0.0"
             - --port
             - "8000"
-            # HF REPO ID, not a local path: the router runs on the CPU worker,
-            # which has no /mnt/nvme. The tokenizer is a few MB, the repo is
-            # public, no token needed. Do NOT set HF_HUB_OFFLINE on this pod.
+            # The CPU worker has no GPU-node NVMe. This baseline resolves a
+            # Hub ID at startup, so do not set HF_HUB_OFFLINE on this pod.
+            # Round-robin baseline. Before enabling kv-aware, mount the full
+            # K3 tokenizer on this CPU router and use its local path: the
+            # overlay's Hub fetch omits tokenization_kimi.py and tiktoken.model.
+            # See the KV-aware routing guide for image and validation details.
             - --router-tokenizer-path
             - moonshotai/Kimi-K3
             - --discovery-backend

@@ -152,12 +152,13 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
-The router must spread the load. Under traffic every engine logs an
-`Engine 000: ... Running: N reqs` line every 10 s; an engine that stays
-silent is idle. The router logs one `pick ... picked=<ip>:30000` line per
-request and role; the picks must rotate across the four prefill and the two
-decode addresses and `request_blocks` must be non-zero (else see the
-"Router pinned on one worker per role" trap below):
+Validate routing within each role. Independent short requests should not stay
+pinned to one worker; warmed sessions can legitimately favor a worker with a
+cached prefix. Prompts shorter than the advertised block size (768 tokens in
+AMD's K3 setup) can have `request_blocks=0`. Use long repeated prefixes to
+validate cache affinity and compare engine counters per worker. See
+[08 — KV-aware routing](08-kv-aware-routing.md) for the complete procedure.
+Router picks provide a useful first inspection (not an engine request count):
 
 ```bash
 kubectl logs deploy/infera --since=5m | grep -oE 'role=(prefill|decode)|picked=[0-9.]+' | paste - - | sort | uniq -c
@@ -208,18 +209,14 @@ The weights stay on the shared volume for the next start.
 - **Switching modes re-stages.** Aggregated → PD (or back) releases every
   node; the new pods copy from the volume again. Budget the copy time; do
   not expect the second mode to come up faster.
-- **Router pinned on one worker per role.** The kv-aware policy tokenizes
-  every request and scores workers by cache misses plus load, both in token
-  blocks. If the tokenizer does not load (the router logs `kv-aware: ...
-  failed`; every `pick` line reads `request_blocks=0`) every worker ties at
-  zero and the first one wins, forever: six nodes serve like one prefill
-  and one decode while billing six, and only a load test shows it
-  (2026-09-10: TTFT p50 81 s at 2 req/s, four engines silent). Kimi-K3's
-  tokenizer is custom code (`tokenization_kimi.py` + `tiktoken.model`) the
-  Hub id does not bring down, so the market router reads it from the staged
-  weights on the shared volume (`--router-tokenizer-path
-  /shared/kimi-k3/weights/Kimi-K3`). `--router-policy round-robin` is the
-  stateless fallback while a tokenizer problem is open.
+- **Router pinned on one worker per role.** Two fixes are required. The
+  complete K3 tokenizer must be available at `--router-tokenizer-path
+  /shared/kimi-k3/weights/Kimi-K3`; the overlay's Hub download misses its custom
+  code and `tiktoken.model`. The old overlay also failed to charge routing load
+  for zero-block requests, including valid short prompts. The pinned v0.2.9
+  fixes this load accounting; it does not supply missing tokenizer files.
+  The policy and weights are now explicit. Use `round-robin` as a diagnostic
+  baseline and follow [08](08-kv-aware-routing.md) before tuning role weights.
 - **Partial PD.** Pods are admitted one at a time as nodes arrive. A single
   prefill or decode worker up on its own is not an error; the router waits
   for the other role. If one role never arrives, check the market (price,

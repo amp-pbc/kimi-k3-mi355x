@@ -115,6 +115,9 @@ curl "$ENDPOINT/v1/chat/completions" -H "Authorization: Bearer $KEY" \
 4. **Verify the handoff** with the reliable gates in
    [docs/04](docs/04-verification.md) — do *not* trust `/sys/kernel/mm/memory_peers`.
 
+Read [KV-aware routing configuration and validation](docs/08-kv-aware-routing.md)
+before comparing multi-node performance.
+
 ## Benchmarking
 
 `bench/orbench.py` drives open-loop, mixed traffic and scores on the view an
