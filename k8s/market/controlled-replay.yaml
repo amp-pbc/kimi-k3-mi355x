@@ -1,0 +1,59 @@
+# One controlled 4-prefill / 2-decode routing arm, run inside the cluster.
+# Prerequisite ConfigMap kimi-k3-controlled-replay contains:
+#   orbench.py, controlled_replay.py, fixture.json.gz, deployment.yaml
+# Create it using docs/09-controlled-rerun.md after capturing the actual
+# deployment. Select the intended kube context explicitly for every command.
+# This Job never changes serving policy or resets caches. Each run requires
+# a unique Job name and output directory; preserve failed-run receipts too.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-controlled-replay
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      containers:
+        - name: replay
+          image: python:3.12-slim
+          env:
+            - {name: ROUTER_BASE, value: "http://infera:8000"}
+            - {name: ARM, value: "kv-aware-p1-d1-repeat1"}
+            - {name: CACHE_STATE, value: "fresh-prefix"}
+            - {name: DRAIN, value: "180"}
+            - {name: IDLE_TIMEOUT, value: "180"}
+            - {name: POD_UID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              pip install --quiet --no-cache-dir 'httpx==0.28.1'
+              OUT="/shared/kimi-k3/controlled-replay/$POD_UID"
+              # run() creates OUT exclusively; tee writes outside it until then.
+              mkdir -p /shared/kimi-k3/controlled-replay
+              python3 -u /bench/controlled_replay.py run \
+                --base "$ROUTER_BASE" --arm "$ARM" --cache-state "$CACHE_STATE" \
+                --fixture /bench/fixture.json.gz --manifest /bench/deployment.yaml \
+                --out "$OUT" --drain "$DRAIN" --idle-timeout "$IDLE_TIMEOUT" \
+                2>&1 | tee "/shared/kimi-k3/controlled-replay/$POD_UID.log"
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {memory: 8Gi}
+          volumeMounts:
+            - {name: bench, mountPath: /bench, readOnly: true}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: bench
+          configMap: {name: kimi-k3-controlled-replay}
+        - name: shared
+          hostPath: {path: /mnt/shared, type: Directory}
