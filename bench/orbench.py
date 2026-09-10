@@ -34,7 +34,7 @@ CONFIG (all via env, with generic defaults):
   API_KEY        bearer token; empty = no auth (many engines require none)
   ORBENCH_MODEL  model id (default moonshotai/kimi-k3)
 """
-import argparse, asyncio, csv, json, os, random, statistics as st, time
+import argparse, asyncio, csv, json, math, os, random, statistics as st, time
 import httpx
 
 # Overridable so the bench survives endpoint moves and can aim at an in-cluster
@@ -92,24 +92,31 @@ class Sessions:
         self.next_id = 0
 
     def take(self, prompt_tokens):
-        live = [k for k, v in self.pool.items() if len(v["msgs"]) < 2 * v["max_turns"]]
+        live = [k for k, v in self.pool.items()
+                if not v["busy"] and len(v["msgs"]) < 2 * v["max_turns"]]
         if live and self.rng.random() < 0.75:
             k = self.rng.choice(live)
             s = self.pool[k]
+            s["busy"] = True
             s["msgs"].append({"role": "user",
                               "content": f"Turn {len(s['msgs'])//2+1}: continue, one short paragraph."})
             return k, list(s["msgs"])
         k = self.next_id; self.next_id += 1
         base = [{"role": "system", "content": "PROJECT CONTEXT:\n" + filler(self.rng, prompt_tokens)},
                 {"role": "user", "content": "Turn 1: summarise the context in one short paragraph."}]
-        self.pool[k] = {"msgs": list(base), "max_turns": self.rng.randint(2, 6)}
+        self.pool[k] = {"msgs": list(base), "max_turns": self.rng.randint(2, 6), "busy": True}
         if len(self.pool) > 60:
-            for old in list(self.pool)[:20]: self.pool.pop(old, None)
+            for old in [key for key, value in self.pool.items() if not value["busy"]][:20]:
+                self.pool.pop(old, None)
         return k, list(base)
 
-    def record_reply(self, k, text):
-        if k in self.pool and text:
-            self.pool[k]["msgs"].append({"role": "assistant", "content": text[:2000]})
+    def record_reply(self, k, reply):
+        if k in self.pool:
+            self.pool[k]["msgs"].append(reply)
+            self.pool[k]["busy"] = False
+
+    def discard(self, k):
+        self.pool.pop(k, None)
 
 
 class Bench:
@@ -117,6 +124,8 @@ class Bench:
         self.rows = []
         self.inflight = 0
         self.peak_inflight = 0
+        self.offered = {}
+        self.durations = {}
         self.f = open(csv_path, "w", newline="")
         self.w = csv.writer(self.f)
         self.w.writerow(["ts","rate","slice","session","turn","status","ttft_s","total_s",
@@ -124,10 +133,6 @@ class Bench:
         self.f.flush()
 
     def add(self, **kw):
-        if self.f.closed:
-            # a request that outlived the last drain finishes after main()
-            # closed the CSV: nothing to record, never a traceback
-            return
         self.rows.append(kw)
         self.w.writerow([f"{kw['ts']:.3f}", kw["rate"], kw["slice"], kw["session"], kw["turn"],
                          kw["status"], "" if kw["ttft_s"] is None else f"{kw['ttft_s']:.3f}",
@@ -137,22 +142,32 @@ class Bench:
         self.f.flush()
 
 
-async def one_request(client, bench, rate, rng, sessions):
-    name, _, plo, pmode, phi, olo, ohi, use_session = pick_slice(rng)
-    ptok = int(rng.triangular(plo, phi, pmode))
-    otok = rng.randint(olo, ohi)
-    sess, turn = -1, 0
-    if use_session:
-        sess, msgs = sessions.take(ptok)
-        turn = len(msgs) // 2
+async def one_request(client, bench, rate, rng, sessions, request=None):
+    if request is None:
+        name, _, plo, pmode, phi, olo, ohi, use_session = pick_slice(rng)
+        ptok = int(rng.triangular(plo, phi, pmode))
+        otok = rng.randint(olo, ohi)
+        sess, turn = -1, 0
+        if use_session:
+            sess, msgs = sessions.take(ptok)
+            turn = len(msgs) // 2
+        else:
+            msgs = [{"role": "user", "content": filler(rng, ptok)}]
+        body = {"model": MODEL, "messages": msgs, "max_tokens": otok}
     else:
-        msgs = [{"role": "user", "content": filler(rng, ptok)}]
-    body = {"model": MODEL, "messages": msgs, "max_tokens": otok,
-            "stream": True, "stream_options": {"include_usage": True}}
+        # A recorded request fixes prompt content independently of responses.
+        name = request.get("slice", "replay")
+        sess, turn = request["session"], request["turn"]
+        use_session = False
+        body = dict(request["body"])
+    body.update(stream=True, stream_options={"include_usage": True})
 
     bench.inflight += 1
+    bench.offered[rate] = bench.offered.get(rate, 0) + 1
     bench.peak_inflight = max(bench.peak_inflight, bench.inflight)
-    t0 = time.time(); first = None; usage = None; err = None; code = 0; text = []
+    t0 = time.monotonic(); first = None; usage = None; err = None; code = 0
+    reply = {"role": "assistant", "content": ""}
+    stream_done = False; finished = False; cancelled = False
     headers = {"Authorization": f"Bearer {KEY}"} if KEY else {}
     try:
         async with client.stream("POST", BASE, json=body, headers=headers) as r:
@@ -163,41 +178,80 @@ async def one_request(client, bench, rate, rng, sessions):
                 async for line in r.aiter_lines():
                     if not line.startswith("data:"): continue
                     p = line[5:].strip()
-                    if p == "[DONE]": break
-                    if first is None: first = time.time() - t0
+                    if p == "[DONE]":
+                        stream_done = True
+                        break
                     try:
                         d = json.loads(p)
-                        if d.get("usage"): usage = d["usage"]
+                        if d.get("error"):
+                            err = "stream_error"
+                            break
+                        if d.get("usage"):
+                            usage = d["usage"]
+                            if not isinstance(usage, dict):
+                                raise ValueError("invalid usage")
+                            for key in ("completion_tokens", "prompt_tokens"):
+                                value = usage.get(key)
+                                if value is not None and (not isinstance(value, int) or value < 0):
+                                    raise ValueError("invalid token count")
                         ch = d.get("choices") or []
-                        if ch and ch[0].get("delta", {}).get("content"):
-                            text.append(ch[0]["delta"]["content"])
-                    except Exception: pass
+                        if ch:
+                            delta = ch[0].get("delta", {})
+                            if ch[0].get("finish_reason") is not None:
+                                finished = True
+                            # Role/usage events are not generated tokens.
+                            if first is None and any(delta.get(k) for k in
+                                    ("content", "reasoning", "reasoning_content", "tool_calls")):
+                                first = time.monotonic() - t0
+                            for key in ("content", "reasoning", "reasoning_content"):
+                                if delta.get(key):
+                                    reply[key] = reply.get(key, "") + delta[key]
+                    except (ValueError, TypeError, AttributeError, KeyError):
+                        usage = None
+                        err = "invalid_stream"
+                        break
+    except asyncio.CancelledError:
+        err = "cancelled_unfinished"
+        cancelled = True
     except Exception as e:
         err = type(e).__name__
     finally:
         bench.inflight -= 1
 
-    total = time.time() - t0
+    total = time.monotonic() - t0
     ct = (usage or {}).get("completion_tokens")
     # Router's definition: output tokens / TOTAL time, TTFT included.
-    tps = (ct / max(total, 1e-6)) if ct else None
-    ok = bool(code == 200 and first is not None)   # completed (no SLA gate)
-    if use_session and code == 200:
-        sessions.record_reply(sess, "".join(text))
+    ok = bool(code == 200 and stream_done and finished and err is None)
+    if not ok and err is None:
+        err = "incomplete_stream"
+    tps = (ct / max(total, 1e-6)) if ok and ct else None
+    if use_session:
+        if ok: sessions.record_reply(sess, reply)
+        else: sessions.discard(sess)
     bench.add(ts=time.time(), rate=rate, slice=name, session=sess, turn=turn, status=code,
               ttft_s=first, total_s=total, prompt_tokens=(usage or {}).get("prompt_tokens"),
               completion_tokens=ct, tok_per_s=tps, completed=ok, err=err)
+    if cancelled:
+        raise asyncio.CancelledError
+    return ok
 
 
 async def run_rate(client, bench, rate, secs, rng, sessions, drain_s, arrival=None):
     """Poisson arrivals at `rate` req/s for `secs`, then drain."""
     tasks = []
-    t0 = time.time(); nxt_log = t0 + 30
-    while time.time() - t0 < secs:
-        await asyncio.sleep(rng.expovariate(arrival if arrival is not None else rate))
+    bench.durations[rate] = secs
+    t0 = time.time(); start = time.monotonic(); nxt_log = start + 30
+    # Separate arrivals from workload sampling, so responses do not consume
+    # the PRNG state that defines the arrival schedule.
+    arrival_rng = random.Random(rng.getrandbits(64))
+    next_arrival = start
+    while True:
+        next_arrival += arrival_rng.expovariate(arrival if arrival is not None else rate)
+        if next_arrival >= start + secs:
+            break
+        await asyncio.sleep(max(0, next_arrival - time.monotonic()))
         tasks.append(asyncio.create_task(one_request(client, bench, rate, rng, sessions)))
-        tasks = [t for t in tasks if not t.done()]
-        if time.time() >= nxt_log:
+        if time.monotonic() >= nxt_log:
             # Single pass over the rows for the progress line (avoids a quadratic
             # multi-scan over a long run).
             n = g = f429 = 0
@@ -213,12 +267,25 @@ async def run_rate(client, bench, rate, secs, rng, sessions, drain_s, arrival=No
                 if r["tok_per_s"]:
                     tp.append(r["tok_per_s"])
             med = st.median(tp) if tp else 0.0
-            print(f"    rate={rate:<4.1f} +{(time.time()-t0)/60:4.1f}m  offered={n:5d} "
+            n = bench.offered.get(rate, 0)
+            print(f"    rate={rate:<4.1f} +{(time.monotonic()-start)/60:4.1f}m  offered={n:5d} "
                   f"completed={100*g/max(n,1):5.1f}%  med tok/s={med:5.1f}  429={f429:4d}  inflight={bench.inflight:4d}",
                   flush=True)
             nxt_log += 30
+    await asyncio.sleep(max(0, start + secs - time.monotonic()))
     if tasks:
-        await asyncio.wait(tasks, timeout=drain_s)
+        _, pending = await asyncio.wait(tasks, timeout=drain_s)
+        for task in pending:
+            task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        if pending:
+            # Closing clients does not prove the server has stopped work.
+            # Abort the sweep instead of contaminating the next arm.
+            raise RuntimeError(f"drain_timeout: {len(pending)} unfinished requests; "
+                               "sweep stopped, verify engine queues before another run")
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
     return t0
 
 
@@ -230,18 +297,20 @@ def pct(xs, p):
 def summarise(bench, rate, t0):
     g = [r for r in bench.rows if r["rate"] == rate]
     if not g: return None
-    done = [r for r in g if r["status"] == 200 and r["ttft_s"] is not None]
+    done = [r for r in g if r["completed"]]
     r429 = [r for r in g if r["status"] == 429]
-    othererr = [r for r in g if r["status"] not in (200, 429) or (r["status"] == 200 and r["ttft_s"] is None)]
-    wall = max(r["ts"] for r in g) - t0
+    othererr = [r for r in g if not r["completed"] and r["status"] != 429]
+    wall = max(1e-6, bench.durations.get(rate, 0), max(r["ts"] for r in g) - t0)
+    offered_window = max(1e-6, bench.durations.get(rate, wall))
     outtok = sum((r["completion_tokens"] or 0) for r in done)
     intok = sum((r["prompt_tokens"] or 0) for r in done)
-    tt = [r["ttft_s"] for r in done]
-    return dict(rate=rate, offered=len(g), offered_rps=len(g)/wall, completed=len(done),
+    tt = [r["ttft_s"] for r in done if r["ttft_s"] is not None]
+    speeds = [r["tok_per_s"] for r in done if r["tok_per_s"] is not None]
+    return dict(rate=rate, offered=len(g), offered_rps=len(g)/offered_window, completed=len(done),
                 completed_pct=100*len(done)/len(g), r429=len(r429), othererr=len(othererr),
                 out_tps=outtok/wall, in_tps=intok/wall,
                 ttft_p50=pct(tt,.50), ttft_p90=pct(tt,.90), ttft_p99=pct(tt,.99),
-                med_tok_s=st.median([r["tok_per_s"] for r in done if r["tok_per_s"]]) if done else 0)
+                med_tok_s=st.median(speeds) if speeds else 0)
 
 
 async def main():
@@ -251,9 +320,14 @@ async def main():
     ap.add_argument("--warm", type=int, default=120)
     ap.add_argument("--drain", type=int, default=180)
     ap.add_argument("--csv", default="./orbench.csv")
+    ap.add_argument("--seed", type=int, default=20260804)
     a = ap.parse_args()
     rates = [float(x) for x in a.rates.split(",")]
-    rng = random.Random(20260804)
+    if not rates or any(not math.isfinite(x) or x <= 0 for x in rates) or a.secs <= 0 or a.warm < 0 or a.drain <= 0:
+        ap.error("rates, secs and drain must be positive; warm must be nonnegative")
+    if len(set(rates)) != len(rates):
+        ap.error("duplicate rates are ambiguous; use separate runs")
+    rng = random.Random(a.seed)
     sessions = Sessions(rng)
     bench = Bench(a.csv)
 
@@ -262,6 +336,7 @@ async def main():
           " TTFT included), TTFT percentiles, completion rate, 429s")
     print("mix: 60% chat 200-2k, 30% agentic 4k-32k multi-turn (growing prefix), 10% longctx 32k-200k")
     print(f"CSV -> {a.csv}\n", flush=True)
+    print(f"seed={a.seed}; engine cache is NOT reset between runs", flush=True)
 
     limits = httpx.Limits(max_connections=2000, max_keepalive_connections=400)
     async with httpx.AsyncClient(timeout=httpx.Timeout(900.0), limits=limits) as client:
@@ -279,6 +354,9 @@ async def main():
             print(f"\n--- offering {rate} req/s for {a.secs}s ---", flush=True)
             t0 = await run_rate(client, bench, rate, a.secs, rng, sessions, a.drain)
             s = summarise(bench, rate, t0)
+            if s is None:
+                print("    => no arrivals in this interval", flush=True)
+                continue
             results.append(s)
             print(f"    => displayed tok/s {s['med_tok_s']:.1f}  completed {s['completed_pct']:.1f}%  "
                   f"429 {s['r429']}  TTFT p50 {s['ttft_p50']:.2f}s p99 {s['ttft_p99']:.2f}s", flush=True)
@@ -292,20 +370,22 @@ async def main():
               f"{s['ttft_p50']:7.2f}s {s['ttft_p90']:7.2f}s {s['ttft_p99']:7.2f}s")
     print(f"\n{'='*94}\nPER-SLICE: who consumes the capacity\n{'='*94}")
     print(f"  {'slice':9s} {'reqs':>6s} {'%reqs':>6s} {'input tokens':>14s} {'%input':>7s} {'tok/s/req':>9s} {'TTFTp50':>8s}")
-    tot_in = sum((r["prompt_tokens"] or 0) for r in bench.rows if r["status"] == 200)
+    tot_in = sum((r["prompt_tokens"] or 0) for r in bench.rows if r["completed"])
     tot_n  = len([r for r in bench.rows if r["rate"] > 0])
     for nm, *_ in SLICES:
         g = [r for r in bench.rows if r["slice"] == nm and r["rate"] > 0]
         if not g: continue
-        d = [r for r in g if r["status"] == 200 and r["ttft_s"] is not None]
+        d = [r for r in g if r["completed"]]
         ti = sum((r["prompt_tokens"] or 0) for r in d)
-        mt = st.median([r["tok_per_s"] for r in d if r["tok_per_s"]]) if d else 0.0
+        speeds = [r["tok_per_s"] for r in d if r["tok_per_s"] is not None]
+        mt = st.median(speeds) if speeds else 0.0
         print(f"  {nm:9s} {len(g):6d} {100*len(g)/max(tot_n,1):5.1f}% {ti:14,d} "
-              f"{100*ti/max(tot_in,1):6.1f}% {mt:9.1f} {pct([r['ttft_s'] for r in d],.50):7.2f}s")
+              f"{100*ti/max(tot_in,1):6.1f}% {mt:9.1f} {pct([r['ttft_s'] for r in d if r['ttft_s'] is not None],.50):7.2f}s")
     print("\n  Operating point: highest rate where displayed tok/s stays competitive")
     print("  vs the model's provider page, TTFT is flat, completion ~100%, 429 ~ 0.")
     print("  (A router displays MEDIANS measured on routed traffic and routes on")
     print("   them; there is no pass/fail bar — do not introduce one here.)")
     bench.f.close()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

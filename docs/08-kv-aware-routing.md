@@ -118,19 +118,19 @@ implementation; switching backends is a separate experiment, not a prerequisite.
 
 ## Limits of the bundled load test
 
-`bench/orbench.py` and its market/Getting Started copies offer a synthetic mix,
-not a controlled cache-affinity replay. In the audited versions, a session can
-be reused while its previous turn is still in flight; the drain timeout does
-not cancel/join remaining requests before the next rate; and an HTTP 200 with
-a first SSE line can be counted as success even if the stream later fails.
-The fixed random seed also reuses prompts across runs while engine caches
-persist. These can change measured traffic and cache warmth between runs.
+`bench/orbench.py` and its market/Getting Started copies offer a synthetic mix.
+The corrected implementation prevents overlapping turns in one session,
+requires a finish event plus `[DONE]` for successful SSE completion, and cancels
+and joins unfinished requests before aborting a sweep whose drain timed out.
+Interrupted requests count as failures. Role/usage-only events do not start TTFT.
 
-Treat existing sweep results as exploratory. For a publishable comparison,
-use a replay that enforces causal sessions and complete-stream accounting,
-run one rate per process, and wait for engine queues to empty between arms.
-Record unfinished requests as failures. A routing fix is not evidence that
-this benchmark's repeatability issues have been resolved.
+Session selection can still vary with response timing. A fixed random seed
+reuses prompts across runs while engine caches persist. For matched-input
+routing comparisons use the [controlled rerun procedure](09-controlled-rerun.md)
+and `bench/controlled_replay.py`: fixed request bodies, causal per-session
+pacing, before/after idle checks, and per-worker engine metrics. The built-in
+fixtures test routing; representative capacity still needs a real workload.
+No six-node result is implied by source-level benchmark corrections.
 
 ## Sources
 

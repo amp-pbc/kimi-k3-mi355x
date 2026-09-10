@@ -120,6 +120,9 @@ before comparing multi-node performance.
 
 ## Benchmarking
 
+For the six-node routing comparison, use the [controlled rerun procedure](docs/09-controlled-rerun.md).
+It saves per-worker receipts and separates fresh-prefix and warm measurements.
+
 `bench/orbench.py` drives open-loop, mixed traffic and scores on the view an
 OpenRouter-style monitor uses (median per-request tok/s incl. TTFT, TTFT
 percentiles, completion rate, 429s). Run it **from inside the cluster**, not
