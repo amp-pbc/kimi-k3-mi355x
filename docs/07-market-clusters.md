@@ -152,6 +152,17 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"moonshotai/Kimi-K3","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
+The router must spread the load. Under traffic every engine logs an
+`Engine 000: ... Running: N reqs` line every 10 s; an engine that stays
+silent is idle. The router logs one `pick ... picked=<ip>:30000` line per
+request and role; the picks must rotate across the four prefill and the two
+decode addresses and `request_blocks` must be non-zero (else see the
+"Router pinned on one worker per role" trap below):
+
+```bash
+kubectl logs deploy/infera --since=5m | grep -oE 'role=(prefill|decode)|picked=[0-9.]+' | paste - - | sort | uniq -c
+```
+
 ### 6. Load test, from inside the cluster
 
 ```bash
@@ -196,6 +207,18 @@ The weights stay on the shared volume for the next start.
 - **Switching modes re-stages.** Aggregated → PD (or back) releases every
   node; the new pods copy from the volume again. Budget the copy time; do
   not expect the second mode to come up faster.
+- **Router pinned on one worker per role.** The kv-aware policy tokenizes
+  every request and scores workers by cache misses plus load, both in token
+  blocks. If the tokenizer does not load (the router logs `kv-aware: ...
+  failed`; every `pick` line reads `request_blocks=0`) every worker ties at
+  zero and the first one wins, forever: six nodes serve like one prefill
+  and one decode while billing six, and only a load test shows it
+  (2026-09-10: TTFT p50 81 s at 2 req/s, four engines silent). Kimi-K3's
+  tokenizer is custom code (`tokenization_kimi.py` + `tiktoken.model`) the
+  Hub id does not bring down, so the market router reads it from the staged
+  weights on the shared volume (`--router-tokenizer-path
+  /shared/kimi-k3/weights/Kimi-K3`). `--router-policy round-robin` is the
+  stateless fallback while a tokenizer problem is open.
 - **Partial PD.** Pods are admitted one at a time as nodes arrive. A single
   prefill or decode worker up on its own is not an error; the router waits
   for the other role. If one role never arrives, check the market (price,

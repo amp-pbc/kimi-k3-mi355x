@@ -30,7 +30,11 @@
 #      its node's NVMe before the engine starts (1.5 TB per node, one read of
 #      the volume per node). The engine always loads from the NVMe.
 #   5. The router runs on the CPU worker (no GPU request = not market demand,
-#      starts within a minute) and fetches the tokenizer from the Hub.
+#      starts within a minute) and reads the tokenizer from the weights on
+#      the shared volume. It tokenizes every request to route it by
+#      prefix-cache locality and least load; without a working tokenizer
+#      every worker ties and ALL traffic lands on the first worker of each
+#      role (2026-09-10: four of six nodes idle under a load test).
 #
 # Host prerequisites (docs/01, docs/06) are the PLATFORM's job on a market
 # cluster: GPU-direct RDMA (PeerDirect) is converged by the node image's
@@ -142,10 +146,15 @@ spec:
             - "0.0.0.0"
             - --port
             - "8000"
-            # HF REPO ID, not a local path: the CPU worker has no /mnt/nvme.
-            # Public repo, a few MB, no token. Do NOT set HF_HUB_OFFLINE here.
+            # LOCAL PATH on the shared volume: the CPU worker has no /mnt/nvme
+            # but mounts /mnt/shared, where step 1 staged the weights. Kimi-K3's
+            # tokenizer is custom code (tokenization_kimi.py + tiktoken.model);
+            # with the Hub id the router fetched only tokenizer_config.json,
+            # the load failed, every request hashed to ZERO blocks and the
+            # kv-aware policy pinned all traffic on one prefill + one decode
+            # (2026-09-10). Same directory the engines load from.
             - --router-tokenizer-path
-            - moonshotai/Kimi-K3
+            - /shared/kimi-k3/weights/Kimi-K3
             - --discovery-backend
             - kubernetes
             # Both roles' pods carry this label; the router tells prefill from
@@ -156,9 +165,11 @@ spec:
             - http
             - --kv-event-transport
             - zmq
-            # Router policy: kv-aware by default (the InferaDeployment recipe
-            # sets none). docs/03: force round-robin while a role has a single
-            # replica; with 2+ per role the default stands. To force it, add:
+            # Router policy: kv-aware (the default): cost = cache misses + load,
+            # both in token blocks, ties broken by least load. It NEEDS the
+            # tokenizer above. If the router logs "kv-aware: ... failed" and
+            # every "pick" line reads request_blocks=0, fall back to a
+            # stateless spread until the tokenizer loads:
             #   - --router-policy
             #   - round-robin
           env:
@@ -180,9 +191,16 @@ spec:
             failureThreshold: 6
           volumeMounts:
             - {name: overlay, mountPath: /overlay, readOnly: true}
+            - {name: shared, mountPath: /shared, readOnly: true}
       volumes:
         - name: overlay
           emptyDir: {}
+        # The cluster's shared volume, mounted on the CPU worker at /mnt/shared
+        # (the same mount the staging Job wrote). The router reads only the
+        # tokenizer files from it. type: Directory fails the pod loudly if the
+        # mount is missing instead of routing on an empty directory.
+        - name: shared
+          hostPath: {path: /mnt/shared, type: Directory}
 ---
 # Decode-side engine metrics (port 30000 on the host network). NOT for
 # serving traffic: the router reaches workers directly. The decode engine's
