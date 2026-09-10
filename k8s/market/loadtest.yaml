@@ -19,8 +19,15 @@
 # measures a smaller deployment than you paid for. Prints "workers ready:
 # N/M" every 30 s while waiting.
 #
-# Defaults sweep 0.5, 1, 2 and 4 req/s, 120 s each after a 60 s warm-up,
-# 120 s drain between rates: about 17 minutes. Change the env values below
+# One Job for the one-node aggregated recipe and the six-node PD one alike
+# (same router at infera:8000, same worker label). The sweep follows the
+# deployment it finds when RATES is left empty: one worker gets 0.25, 0.5, 1
+# and 2 req/s, more workers get 0.5, 1, 2 and 4 — a single TP8 node saturates
+# below the rate six nodes do, and a sweep that starts past the knee shows
+# only the backlog. Either way 120 s per rate after a 60 s warm-up, 120 s
+# drain between rates: about 17 minutes. Set RATES, SECS, WARM and DRAIN
+# below to sweep differently.
+#
 # The RESULTS OUTLIVE THIS JOB on clusters with a shared volume: the full
 # console output lands at /mnt/shared/kimi-k3/loadtest/orbench-<time>.log
 # with the per-request CSV beside it, and latest.log / latest.csv point at
@@ -362,13 +369,16 @@ data:
     Why: a load test that starts while a role is missing measures 503s (the
     router refuses every request until one prefill and one decode worker are
     up), and one that starts before the last worker measures a smaller
-    deployment than the one you paid for."""
+    deployment than the one you paid for. On success the worker count is
+    left in WORKERS_FILE (/tmp/workers) for the Job's shell, which picks the
+    default sweep by it."""
     import os
     import sys
 
     import httpx
 
     ROUTER = sys.argv[1]
+    WORKERS_FILE = os.environ.get("WORKERS_FILE", "/tmp/workers")
     LABEL = os.environ.get("WORKER_LABEL", "app.kubernetes.io/name=kimi-k3-infera")
     EXPECT = int(os.environ.get("EXPECT_WORKERS") or 0)
     SA = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -423,6 +433,9 @@ data:
               and roles_ok and len(w) >= EXPECT)
         print(f"[loadtest] workers ready: {ready}/{total} · router sees {len(w)} "
               f"active · roles complete: {'yes' if roles_ok else 'no'}", flush=True)
+    if ok:
+        with open(WORKERS_FILE, "w") as f:
+            f.write(str(p[1] if p is not None else len(w)))
     sys.exit(0 if ok else 1)
 ---
 apiVersion: batch/v1
@@ -464,8 +477,10 @@ spec:
             - {name: WORKER_LABEL, value: "app.kubernetes.io/name=kimi-k3-infera"}
             - {name: EXPECT_WORKERS, value: ""}
             # the sweep: offered request rates (req/s), seconds per rate,
-            # warm-up seconds (discarded), drain seconds between rates
-            - {name: RATES, value: "0.5,1,2,4"}
+            # warm-up seconds (discarded), drain seconds between rates. RATES
+            # empty = by the deployment found: one worker 0.25,0.5,1,2; more
+            # workers 0.5,1,2,4 (see the header). Set it to sweep differently.
+            - {name: RATES, value: ""}
             - {name: SECS, value: "120"}
             - {name: WARM, value: "60"}
             - {name: DRAIN, value: "120"}
@@ -490,6 +505,11 @@ spec:
                 sleep 30
               done
               echo "[loadtest] deployment up after $(( $(date +%s) - T0 )) s"
+              WORKERS=$(cat /tmp/workers 2>/dev/null || echo 0)
+              if [ -z "$RATES" ]; then
+                if [ "$WORKERS" -le 1 ]; then RATES="0.25,0.5,1,2"; else RATES="0.5,1,2,4"; fi
+                echo "[loadtest] RATES not set: $WORKERS worker(s) up, sweeping $RATES req/s"
+              fi
               # results: on the shared volume when this cluster has one (a real
               # mount at /shared) — the per-request CSV, the full console output
               # as a .log, and latest.* pointing at this run — so they outlive

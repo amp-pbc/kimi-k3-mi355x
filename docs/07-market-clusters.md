@@ -171,9 +171,10 @@ kubectl logs -f job/kimi-k3-loadtest
 ```
 
 `bench/orbench.py` as a Job on the CPU worker (the script rides in a
-ConfigMap): open-loop Poisson arrivals across the realistic mix, sweeping
-0.5, 1, 2 and 4 req/s by default (edit the `RATES`/`SECS`/`WARM`/`DRAIN`
-env in the file), about 17 minutes. Read the operating point off the
+ConfigMap): open-loop Poisson arrivals across the realistic mix. The sweep
+follows the deployment it finds: 0.5, 1, 2 and 4 req/s here, 0.25, 0.5, 1 and
+2 against the one-node aggregated recipe (set the `RATES`/`SECS`/`WARM`/
+`DRAIN` env in the file to sweep differently), about 17 minutes either way. Read the operating point off the
 rate-vs-stats table as docs/05 describes. The Job offers no load until every
 worker is Ready and discovered by the router (it prints `workers ready: N/M`
 every 30 s while waiting). The results outlive it: the full output lands at
