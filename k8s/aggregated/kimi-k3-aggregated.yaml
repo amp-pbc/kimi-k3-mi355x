@@ -118,15 +118,10 @@ spec:
             - "<IP>"
             - --port
             - "8000"
-            # HF REPO ID, not a local path. A hostPath mount here was a real bug:
-            # /mnt/nvme only exists on the GPU node, and this pod is pinned to the
-            # CPU node, so the mount failed with "is not a directory" and the pod
-            # never left PodInitializing. AMD's recipe avoids this by pinning
-            # server and worker to the SAME node; we deliberately do not, because
-            # the router belongs on the CPU node. Fetching the tokenizer from the
-            # Hub instead is a few MB, needs no token (the repo is public), and
-            # keeps the router free of any dependency on GPU-node storage.
-            # Do NOT set HF_HUB_OFFLINE on this pod.
+            # This recipe defaults to round-robin. Before enabling kv-aware,
+            # stage the COMPLETE tokenizer on CPU-accessible storage and use
+            # its local path here. The overlay's Hub fetch misses K3's custom
+            # tokenization_kimi.py and tiktoken.model. See docs/08.
             - --router-tokenizer-path
             - moonshotai/Kimi-K3
             - --discovery-backend
@@ -137,13 +132,11 @@ spec:
             - http
             - --kv-event-transport
             - zmq
-            # round-robin, not kv-aware. With ONE worker the policy is moot, and
-            # kv-aware measurably degenerated to a single target on the old
-            # image (request_blocks=0, batches_received=0). Retest kv-aware only
-            # when there are 2+ workers to differentiate.
+            # Baseline policy. v0.2.9 fixes zero-block load accounting, but
+            # enabling cache affinity also requires the full tokenizer above.
             - --router-policy
             - round-robin
-            # Cost function is:  w * (request_blocks - hits) + active_blocks
+            # Cost: w * (request_blocks - hits) + active + recent load
             # Lower w favours LOAD BALANCE, higher favours cache reuse.
             # Only consulted when --router-policy is kv-aware.
             - --kv-overlap-weight

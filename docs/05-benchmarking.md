@@ -1,5 +1,8 @@
 # 05 — Benchmarking a Kimi-K3 endpoint
 
+See [KV-aware routing validation and load-test limitations](08-kv-aware-routing.md)
+before comparing multi-worker performance.
+
 This is the methodology behind [`bench/orbench.py`](../bench/orbench.py). The
 goal is to measure your Kimi-K3 endpoint the way a real router (e.g. OpenRouter)
 would measure and route on it, and to find the request rate it can carry. You
