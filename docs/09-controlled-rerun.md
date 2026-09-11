@@ -92,6 +92,10 @@ session order separately on each turn. Earlier turns still complete before
 their successors. Inputs are synthetic identifiers and successor histories
 are recorded text, not generated replies or an actual OpenRouter traffic trace.
 Token targets are estimates; use returned usage for actual input/output lengths.
+All sessions begin in the first turn and are revisited in later turns, so this
+fixed cohort is not a stationary mix of new and returning production sessions.
+Report the fresh-prefix queue buildup as part of the workload instead of
+discarding it as initialization or calling later warm traffic general capacity.
 
 ```bash
 python3 bench/controlled_replay.py generate \
