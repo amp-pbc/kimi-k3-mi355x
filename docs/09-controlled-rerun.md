@@ -27,6 +27,41 @@ not provision the six model workers.
    replay checks active role counts and engine metrics, but cannot prove
    Kubernetes readiness or absence of transport errors on its own.
 
+### Warm the router after every policy rollout
+
+`/health` can return 200 before the KV-aware router has loaded its tokenizer.
+The v0.2.9 Python router loads it lazily when hashing the first request. Send
+an unmeasured request through the router after every restart, require the
+`kv-aware: loaded tokenizer` log on KV-aware arms, and drain all engines before
+taking the measurement baseline. A short request is sufficient to load the
+tokenizer; it does not validate long-prefix locality or warm every GPU shape.
+
+For the market deployment, with `KIMI_CONTEXT` explicitly set:
+
+```bash
+kubectl --context "$KIMI_CONTEXT" -n default exec -i deployment/infera -c server -- python3 - <<'PY'
+import json
+import urllib.request
+
+body = {"model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "Reply with exactly OK."}],
+        "max_tokens": 256, "temperature": 0}
+request = urllib.request.Request(
+    "http://infera:8000/v1/chat/completions",
+    data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(request, timeout=120) as response:
+    result = json.load(response)
+assert result.get("choices"), result
+print(result["choices"][0])
+PY
+```
+
+Also exercise representative input and batch shapes across all GPU workers
+before a steady-state comparison. Record inference-time compilation warnings.
+Router initialization, GPU kernel warmup and prefix-cache state are separate
+variables. If measuring startup, retain those requests and label them explicitly.
+
 ## Request fixtures and measurements
 
 `bench/controlled_replay.py` uses the corrected streaming implementation in
@@ -37,6 +72,11 @@ later request bodies. The built-in long fixture uses a fixed recorded `OK`
 assistant response, so it is a synthetic prefix-locality check rather than a
 production-agent trace. A real recorded chat workload can use the same JSON
 schema. Keep model/generation parameters and fixture seed fixed across policies.
+
+The built-in fixture visits sessions in the same order on each turn. With 32
+sessions and four prefill workers, round-robin can preserve locality by
+coincidence. Use a fixed shuffled arrival order or a recorded production trace
+before interpreting a policy comparison as a general routing advantage.
 
 The long fixture asks for only 32 output tokens. It tests routing and prefix
 reuse, **not decode saturation or representative production capacity**. After
