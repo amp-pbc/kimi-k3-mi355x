@@ -71,6 +71,13 @@ routing validation. Role values override the global value: changing just
 These fixes apply to Python `infera.server`. The Rust router has a separate
 implementation; switching backends is a separate experiment, not a prerequisite.
 
+In PD, inspect prefix caching separately for each role. A decode engine reporting
+`enable_prefix_caching=False` can consume transferred KV successfully while its
+local prefix-query counters and router cache map remain zero. In that case,
+validate prefix affinity on prefill, and request balancing plus external KV
+handoff on decode. Setting a decode overlap weight does not enable the engine's
+prefix cache, and successful PD transfer alone does not prove decode affinity.
+
 ## Validation before a throughput comparison
 
 1. **Capture the actual deployment.** Record router/worker image digests, full
@@ -80,6 +87,10 @@ implementation; switching backends is a separate experiment, not a prerequisite.
    successfully and KV-event subscriptions receive data from the expected
    workers. Persistent subscriber errors or snapshot 404s need investigation;
    pod readiness alone does not clear them.
+   The Python router loads its tokenizer on the first hashed request, after
+   readiness can already pass. After every router rollout, send an unmeasured
+   warmup request, verify the tokenizer-success log, and drain before capturing
+   counters. See the [warmup procedure](09-controlled-rerun.md#warm-the-router-after-every-policy-rollout).
 2. **Test short requests for balancing.** AMD reported a minimum routing block
    of **768 tokens** for this K3 configuration. Confirm the block size advertised
    by the running workers; count tokens after the actual chat template, not
