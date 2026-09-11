@@ -24,6 +24,7 @@
 #                                   images for your build (examples shown).
 #   MC_GID_INDEX                    your device's RoCE v2 GID index (see docs).
 #
+# Overlay pin: v0.2.9 includes the Python zero-block routing fix; see docs/08.
 # The three MC_* env vars, hostNetwork, --data-parallel-address $(POD_IP),
 # and --speculative-config on BOTH roles are load-bearing — see docs/03.
 # Cross-check arg/env details against AMD's reference repo:
@@ -47,7 +48,7 @@ spec:
         tolerations: [{key: amd.com/gpu, operator: Equal, value: present, effect: NoSchedule}]
         initContainers:
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh","-c","cp -a /payload/. /overlay/"]
           volumeMounts:
@@ -58,7 +59,12 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["/overlay/bin/infera-exec","python3","-m","infera.server",
                     "--host","<IP>","--port","8000",
+                    # Local tokenizer must match the workers; see docs/08.
                     "--router-tokenizer-path","/models/Kimi-K3",
+                    "--router-backend","python","--router-policy","kv-aware",
+                    "--kv-overlap-weight","1.0",
+                    "--kv-prefill-overlap-weight","1.0",
+                    "--kv-decode-overlap-weight","1.0",
                     "--request-transport","http","--kv-event-transport","zmq"]
           env:
           - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
@@ -90,7 +96,7 @@ spec:
         dnsPolicy: ClusterFirstWithHostNet
         initContainers:
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh","-c","cp -a /payload/. /overlay/"]
           volumeMounts:
@@ -223,7 +229,7 @@ spec:
         dnsPolicy: ClusterFirstWithHostNet
         initContainers:
         - name: infera-overlay
-          image: inferaimage/infera-overlay@sha256:2efc5f96d18754ca425ed6cc19de5a12503b0ef75a16eae0096a16075a696708
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
           imagePullPolicy: IfNotPresent
           command: ["sh","-c","cp -a /payload/. /overlay/"]
           volumeMounts:

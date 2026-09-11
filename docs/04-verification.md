@@ -1,5 +1,8 @@
 # Verifying that prefill/decode disaggregation actually works
 
+See [KV-aware routing validation and load-test limitations](08-kv-aware-routing.md)
+before comparing multi-worker performance.
+
 A PD deployment can pass every naive check while doing no disaggregation at all.
 All pods report Ready, health probes return 200, restart counts stay at 0, and
 the model returns correct text, because a KV handoff that fails **open** simply

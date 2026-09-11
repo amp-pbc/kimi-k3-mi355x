@@ -41,6 +41,7 @@ docs/
   04-verification.md       how to confirm PD is actually working (reliable gates)
   05-benchmarking.md       how to load-test and score it (OpenRouter-style view)
   06-traps.md              cluster traps that cost hours
+  08-kv-aware-routing.md   tokenizer, image fix, policy weights, validation
 k8s/
   weights-stage-job.yaml   stage the ~1.5 TB checkpoint + DSpark draft to NVMe
   aggregated/              self-contained aggregated serving (DaemonSet + router)
@@ -80,7 +81,14 @@ curl "$ENDPOINT/v1/chat/completions" -H "Authorization: Bearer $KEY" \
 4. **Verify the handoff** with the reliable gates in
    [docs/04](docs/04-verification.md) — do *not* trust `/sys/kernel/mm/memory_peers`.
 
+For multi-worker routing, read [KV-aware configuration and validation](docs/08-kv-aware-routing.md).
+The PD recipes pin the short-input routing fix; six-node performance still
+requires a controlled rerun.
+
 ## Benchmarking
+
+For the six-node routing comparison, use the [controlled rerun procedure](docs/09-controlled-rerun.md).
+It saves per-worker receipts and separates fresh-prefix and warm measurements.
 
 `bench/orbench.py` drives open-loop, mixed traffic and scores on the view an
 OpenRouter-style monitor uses (median per-request tok/s incl. TTFT, TTFT
