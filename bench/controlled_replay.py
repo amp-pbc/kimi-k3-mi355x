@@ -25,30 +25,49 @@ COUNTERS = ("vllm:request_success_total", "vllm:prefix_cache_queries_total",
 
 def fixture(seed, salt, scenario, sessions, turns, rate, model):
     rng = random.Random(seed)
+    arrivals = random.Random(seed ^ 0x51A7) if scenario == "input-heavy" else rng
     requests = []
     histories = {}
     clock = 0.0
     for turn in range(1, turns + 1):
-        for sid in range(sessions):
-            clock += rng.expovariate(rate)
+        order = list(range(sessions))
+        if scenario == "input-heavy":
+            rng.shuffle(order)
+        for sid in order:
+            clock += arrivals.expovariate(rate)
             if sid not in histories:
                 # Salt precedes the long context to isolate cache state across
                 # arms. Word count is not a token count; record actual usage.
-                context = "" if scenario == "short" else orbench.filler(rng, 9000)
+                target = 9000
+                if scenario == "input-heavy":
+                    target = int(rng.triangular(8000, 32000, 16000) if rng.random() < .7
+                                 else rng.triangular(32000, 64000, 48000))
+                context = "" if scenario == "short" else orbench.filler(rng, target)
+                instruction = ("Analyze the supplied synthetic dataset. Explain your method, "
+                               "state limitations, and give a detailed structured answer."
+                               if scenario == "input-heavy" else "Reply with exactly OK.")
                 histories[sid] = [
                     {"role": "system", "content":
-                     f"Fixture {salt}, session {sid:04d}. Reply with exactly OK.\n{context}"}]
-            elif scenario == "long":
+                     f"Fixture {salt}, session {sid:04d}. {instruction}\n{context}"}]
+            elif scenario in ("long", "input-heavy"):
                 # Recorded history, intentionally independent of generated
                 # output. This is a prefix-locality test, not a real agent trace.
-                histories[sid].append({"role": "assistant", "content": "OK"})
+                recorded_reply = ("The dataset contains synthetic identifiers. I will count occurrences, "
+                                  "check for duplicates, and avoid inferring meaning from the identifiers."
+                                  if scenario == "input-heavy" else "OK")
+                histories[sid].append({"role": "assistant", "content": recorded_reply})
             else:
                 raise ValueError("short fixtures use one turn per independent session")
-            histories[sid].append({"role": "user", "content": f"Acknowledge turn {turn}."})
+            question = (f"Turn {turn}: describe a reproducible frequency-analysis procedure for "
+                        "these records, with pseudocode, validation checks and complexity analysis. "
+                        "Explain how you would handle duplicates and incremental updates."
+                        if scenario == "input-heavy" else f"Acknowledge turn {turn}.")
+            histories[sid].append({"role": "user", "content": question})
+            output_budget = rng.choice([128, 256, 256, 256, 512]) if scenario == "input-heavy" else 32
             requests.append({"session": sid, "turn": turn, "at_s": clock,
                              "slice": scenario, "body": {
                                  "model": model, "messages": list(histories[sid]),
-                                 "max_tokens": 32, "temperature": 0}})
+                                 "max_tokens": output_budget, "temperature": 0}})
     # Keep repeated prefixes adjacent for gzip; at_s still defines dispatch
     # timing, independently of serialization order.
     requests.sort(key=lambda r: (r["session"], r["turn"]))
@@ -220,6 +239,15 @@ async def run(args):
         receipt["ttft_s"] = {str(p): orbench.pct(ttft, p) for p in (.5, .9, .99)}
         receipt["completion_tokens"] = sum(r["completion_tokens"] or 0 for r in bench.rows if r["completed"])
         receipt["output_tokens_per_s"] = receipt["completion_tokens"] / max(receipt.get("elapsed_s", 0), 1e-6)
+        receipt["prompt_tokens"] = sum(r["prompt_tokens"] or 0 for r in bench.rows if r["completed"])
+        receipt["input_tokens_per_s"] = receipt["prompt_tokens"] / max(receipt.get("elapsed_s", 0), 1e-6)
+        receipt["usage_complete"] = all(r["prompt_tokens"] is not None and r["completion_tokens"] is not None
+                                        for r in bench.rows if r["completed"])
+        receipt["offered_rate"] = data.get("offered_rate")
+        receipt["offered_window_s"] = max(r["at_s"] for r in data["requests"])
+        receipt["peak_client_inflight"] = bench.peak_inflight
+        receipt["dispatch_delay_p99_s"] = orbench.pct(
+            [r["delay_s"] for r in receipt.get("dispatch_delays", [])], .99)
         (args.out / "summary.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps({k: v for k, v in receipt.items() if k != "dispatch_delays"}, indent=2), flush=True)
     return 0 if receipt["valid"] else 2
@@ -231,7 +259,7 @@ def main():
     generate = sub.add_parser("generate")
     generate.add_argument("--out", type=Path, required=True)
     generate.add_argument("--salt", required=True, help="distinct early prefix per cold arm; repeat for a warm run")
-    generate.add_argument("--scenario", choices=["short", "long"], required=True)
+    generate.add_argument("--scenario", choices=["short", "long", "input-heavy"], required=True)
     generate.add_argument("--sessions", type=int, default=32)
     generate.add_argument("--turns", type=int, default=4)
     generate.add_argument("--rate", type=float, default=.5)

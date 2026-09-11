@@ -227,6 +227,9 @@ def test_full_replay_writes_worker_and_request_receipts(tmp_path, monkeypatch, c
     assert len(summary['workers']) == 6
     assert len(list(out.glob('*.metrics'))) == 12
     assert summary['workers'][0]['prefix_hit_ratio'] == .5
+    assert summary['prompt_tokens'] == 200 and summary['completion_tokens'] == 2
+    assert summary['input_tokens_per_s'] == pytest.approx(100 * summary['output_tokens_per_s'])
+    assert summary['usage_complete']
     receipt_name = 'fixture.json.gz' if compressed else 'fixture.json'
     assert (out / receipt_name).read_bytes() == fixture_path.read_bytes()
 
@@ -238,3 +241,22 @@ def test_default_long_fixture_fits_configmap():
     payload = gzip.compress(json.dumps(data).encode(), mtime=0)
     # Reserve room for both programs, deployment provenance and YAML metadata.
     assert len(base64.b64encode(payload)) < 700000
+
+
+def test_input_heavy_fixture_shuffles_turns_and_preserves_prefixes():
+    a = replay.fixture(42, 'heavy001', 'input-heavy', 12, 3, 4, 'model')
+    b = replay.fixture(42, 'heavy001', 'input-heavy', 12, 3, 4, 'model')
+    assert a == b
+    replay.validate_fixture(a)
+    by_time = sorted(a['requests'], key=lambda r: r['at_s'])
+    orders = [[r['session'] for r in by_time if r['turn'] == t] for t in (1, 2, 3)]
+    assert orders[0] != orders[1] != orders[2]
+    for sid in range(12):
+        turns = [r for r in a['requests'] if r['session'] == sid]
+        assert turns[1]['body']['messages'][:2] == turns[0]['body']['messages']
+        assert turns[2]['body']['messages'][:4] == turns[1]['body']['messages']
+        assert [r['turn'] for r in turns] == [1, 2, 3]
+        assert all('heavy001' in r['body']['messages'][0]['content'][:30] for r in turns)
+        assert all(128 <= r['body']['max_tokens'] <= 512 for r in turns)
+    c = replay.fixture(42, 'heavy002', 'input-heavy', 12, 3, 4, 'model')
+    assert [r['at_s'] for r in a['requests']] == [r['at_s'] for r in c['requests']]
