@@ -1,0 +1,686 @@
+# Kimi-K3 — prefill/decode DISAGGREGATED (PD) + DSpark on a MARKET (dynamic)
+# MI355X cluster, as plain Deployments.
+#
+# Same roles, engine arguments and Mooncake env pins as
+# ../pd-dspark/kimi-k3-pd-dspark.yaml (the InferaDeployment recipe for static
+# clusters), reshaped for a cluster that starts with ZERO GPU nodes and buys
+# them from the market only while a workload asks for them:
+#
+#   1. Plain Deployments, no operator. The Infera operator reconciles an
+#      InferaDeployment into exactly these objects (a Deployment + Service per
+#      component, the infera.amd.com/service label, a discovery
+#      ServiceAccount, the POD_* env); with explicit commands it adds nothing
+#      else. The router learns which worker is prefill and which is decode
+#      from what each engine advertises (its kv_role), not from the operator.
+#      Skipping it means no CRD, no LeaderWorkerSet and no NATS on a tenant
+#      cluster, and Kueue manages the Deployments natively.
+#   2. One node per pod, `replicas` per role = nodes. Every worker pod
+#      requests 8 GPUs and is market demand on its own: Kueue holds it, the
+#      market grants a node at your limit price, the node joins, the pod runs
+#      pinned to it. PD is prefill-bound (docs/03): 2 prefill : 1 decode, so
+#      6 nodes = 4 prefill + 2 decode (below), 8 nodes = 5 + 3 or 6 + 2.
+#      Pods are admitted independently; the router serves as soon as at least
+#      one prefill and one decode worker are up and adds the rest as they
+#      arrive.
+#   3. Nothing pins a hostname. Nodes are named when they join and recycled
+#      (re-imaged) when they leave; Kueue pins each pod to its granted node.
+#   4. Weights come from the cluster's shared volume. A recycled node has an
+#      empty NVMe, so the checkpoint AND the DSpark draft live on the volume
+#      (weights-to-shared.yaml, staged once) and each worker copies both onto
+#      its node's NVMe before the engine starts (1.5 TB per node, one read of
+#      the volume per node). The engine always loads from the NVMe.
+#   5. The router runs on the CPU worker (no GPU request = not market demand,
+#      starts within a minute) and reads the tokenizer from the weights on
+#      the shared volume. It tokenizes every request to route it by
+#      prefix-cache locality and least load. The old overlay tied all workers
+#      at zero when tokenization failed; the v0.2.9 pin below fixes zero-block
+#      load accounting. A valid tokenizer is still required for cache affinity.
+#      Below the advertised block size (768 tokens in AMD's K3 setup), zero
+#      blocks are expected: test short-request balancing separately from reuse.
+#
+# Host prerequisites (docs/01, docs/06) are the PLATFORM's job on a market
+# cluster: GPU-direct RDMA (PeerDirect) is converged by the node image's
+# startup chain and node IPs are real. Verify the receipts on the first node
+# that joins (docs/07-market-clusters.md), then gate PD health on docs/04.
+#
+# The three MC_* env vars, hostNetwork, --data-parallel-address $(POD_IP) and
+# --speculative-config on BOTH roles are load-bearing (docs/03). The
+# platform's NCCL env policy also injects its RCCL defaults, the RDMA device
+# resource and the host ionic provider library into hostNetwork GPU pods; they
+# are compatible with (and redundant to) what is pinned here.
+#
+# Read ../../docs/07-market-clusters.md first: the cluster's Kueue pods-ready
+# timeout must cover a cold start, and switching between this and the
+# aggregated recipe releases the nodes, so the weights are copied again.
+#
+# Model licenses are separate from this repo's Apache-2.0 license; see
+# THIRD_PARTY_NOTICES.md. Keep each upstream LICENSE with its model files.
+#
+#   kubectl apply -f k8s/market/weights-to-shared.yaml   # once per cluster
+#   kubectl apply -f k8s/market/pd-dspark.yaml
+#   kubectl get pods -w
+#   kubectl port-forward svc/infera 8000:8000
+# ---------------------------------------------------------------------------
+# ServiceAccount + RBAC: workers patch their own pod with the
+# infera.amd.com/worker-info annotation so the router can discover them via
+# the Kubernetes API (--discovery-backend kubernetes). Same objects as
+# aggregated.yaml, so applying one recipe after the other is a no-op here.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: kimi-k3-serving, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: kimi-k3-serving, namespace: default}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: kimi-k3-serving, namespace: default}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: kimi-k3-serving}
+subjects: [{kind: ServiceAccount, name: kimi-k3-serving, namespace: default}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: infera
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+# The Infera router (infera.server). Same Deployment name as aggregated.yaml:
+# run ONE recipe at a time; applying this file over the aggregated one
+# replaces the router's arguments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infera
+  namespace: default
+  labels:
+    app.kubernetes.io/name: infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  replicas: 1   # one CPU worker per cluster
+  progressDeadlineSeconds: 900
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 1}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infera
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infera
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      serviceAccountName: kimi-k3-serving
+      # CPU worker only; no GPU toleration on purpose.
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      initContainers:
+        - name: infera-overlay
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cp -a /payload/. /overlay/"]
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay}
+      containers:
+        - name: server
+          image: johnqin2025/kimi-k3-dspark:1.1.0-mi355x-rocm7.2.3-20260802@sha256:5f3007aff1bc231eceb9f024e56ee80e44f9ca101a521aa50fe6bfa6c979d6b8
+          imagePullPolicy: IfNotPresent
+          command:
+            - /overlay/bin/infera-exec
+            - python3
+            - -m
+            - infera.server
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            # LOCAL PATH on the shared volume: the CPU worker has no /mnt/nvme
+            # but mounts /mnt/shared, where step 1 staged the weights. Kimi-K3's
+            # tokenizer is custom code (tokenization_kimi.py + tiktoken.model);
+            # with the Hub id the router fetched only tokenizer_config.json,
+            # the load failed, every request hashed to ZERO blocks and the
+            # kv-aware policy pinned all traffic on one prefill + one decode
+            # on the previous overlay. Same staged files the engines load from.
+            - --router-tokenizer-path
+            - /shared/kimi-k3/weights/Kimi-K3
+            - --discovery-backend
+            - kubernetes
+            # Both roles' pods carry this label; the router tells prefill from
+            # decode by the disaggregation mode each engine registers.
+            - --k8s-label-selector
+            - app.kubernetes.io/name=kimi-k3-infera
+            - --request-transport
+            - http
+            - --kv-event-transport
+            - zmq
+            # Explicit baseline. Role weights override the global weight.
+            # After validating routing, compare prefill=20/decode=2 as a
+            # separate tuning arm. These are suggestions, not defaults.
+            - --router-backend
+            - python
+            - --router-policy
+            - kv-aware
+            - --kv-overlap-weight
+            - "1.0"
+            - --kv-prefill-overlap-weight
+            - "1.0"
+            - --kv-decode-overlap-weight
+            - "1.0"
+            # v0.2.9 charges load for zero-block requests (e.g. <768 tokens).
+            # Long prompts still require the complete tokenizer above and
+            # healthy KV events to gain cache affinity. See routing docs.
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+          ports:
+            - {name: http, containerPort: 8000}
+          resources:
+            # No CPU limit (the tokenizing router stalls under CFS throttling,
+            # see ../aggregated/); requests: 8 leaves the 16 vCPU CPU worker
+            # room for the staging Job and the platform pods.
+            requests: {cpu: "8", memory: 16Gi}
+            limits: {memory: 32Gi}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay, readOnly: true}
+            - {name: shared, mountPath: /shared, readOnly: true}
+      volumes:
+        - name: overlay
+          emptyDir: {}
+        # The cluster's shared volume, mounted on the CPU worker at /mnt/shared
+        # (the same mount the staging Job wrote). The router reads only the
+        # tokenizer files from it. type: Directory fails the pod loudly if the
+        # mount is missing instead of routing on an empty directory.
+        - name: shared
+          hostPath: {path: /mnt/shared, type: Directory}
+---
+# Decode-side engine metrics (port 30000 on the host network). NOT for
+# serving traffic: the router reaches workers directly. The decode engine's
+# /metrics is where the PD health gates of docs/04 read.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k3-decode-metrics
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/component: decode
+  ports:
+    - {name: http, port: 30000, targetPort: 30000}
+---
+# ============================== PREFILL ====================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-k3-prefill
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/component: prefill
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  # 4 prefill + 2 decode = the 6-node shape (2P:1D). Each replica = one node.
+  replicas: 4
+  # maxSurge 0: a replacement pod needs a whole node; a surge pod would just
+  # buy a seventh. maxUnavailable 1 rolls one replica at a time.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  # Cold start = node grant + 1.5 TB copy + engine load; never 600 s.
+  progressDeadlineSeconds: 14400
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kimi-k3-infera
+      app.kubernetes.io/component: prefill
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kimi-k3-infera
+        app.kubernetes.io/component: prefill
+        app.kubernetes.io/part-of: kimi-k3
+        # The label the InferaDeployment recipe and docs/04 select on.
+        infera.amd.com/service: prefill
+    spec:
+      serviceAccountName: kimi-k3-serving
+      tolerations:
+        - {key: amd.com/gpu, operator: Equal, value: present, effect: NoSchedule}
+      # By role label, never by hostname (market nodes are named on join;
+      # Kueue adds the per-request pin that lands the pod on its granted node).
+      nodeSelector:
+        node-role.kubernetes.io/gpu-worker: ""
+      # hostNetwork is REQUIRED: the RDMA rails are host interfaces the pod
+      # network cannot reach, and --data-parallel-address $(POD_IP) below
+      # must advertise an address the decode node can dial (the node IP).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 180
+      initContainers:
+        # Stage the weights AND the DSpark draft onto this node's NVMe: skip
+        # if present; else copy from the shared volume once the staging Job
+        # has completed there (wait while its heartbeat is under 10 minutes
+        # old); else the Hub. Same script as aggregated.yaml.
+        - name: stage-weights
+          image: python:3.12-slim
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              W=/weights
+              S=/shared/kimi-k3/weights
+              PAR=32   # parallel copy streams from the volume (see the copy step)
+              complete() {
+                [ "$(ls "$1"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)" -ge 96 ] \
+                  && [ -f "$1"/Kimi-K3-DSpark/config.json ]
+              }
+              require_model_licenses() {
+                for model_dir in "$W"/Kimi-K3 "$W"/Kimi-K3-DSpark; do
+                  if [ ! -s "$model_dir/LICENSE" ]; then
+                    echo "[stage] FATAL: missing model license: $model_dir/LICENSE" >&2
+                    echo "[stage] Restore the LICENSE from the model's exact upstream revision." >&2
+                    exit 1
+                  fi
+                done
+              }
+              for d in Kimi-K3 Kimi-K3-DSpark; do
+                if [ -L "$W/$d" ]; then rm -f "$W/$d"; fi
+                rm -rf "$W/$d.part"
+              done
+              if complete "$W"; then
+                require_model_licenses
+                echo "[stage] main model + DSpark draft present on this node"; exit 0
+              fi
+              fresh() {
+                [ -f "$S/.staging" ] \
+                  && [ $(( $(date +%s) - $(stat -c %Y "$S/.staging") )) -lt 600 ]
+              }
+              while fresh && [ ! -f "$S/.complete" ]; do
+                echo "[stage] shared volume download in progress: $(ls "$S"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)/96 shards"
+                sleep 60
+              done
+              if [ -f "$S/.complete" ] && complete "$S"; then
+                # Parallel copy. One `cp -a` stream reads the volume at about
+                # 0.55 GB/s (45 minutes for 1.5 TB); 32 files at once read it
+                # at about 14 GB/s on an MI355X node (measured 2026-09-09 on a
+                # VAST export with nconnect=16, RAID10 NVMe: 1.5 TB in about 2
+                # minutes). Directory tree first, then every file and symlink
+                # through xargs -P, then every file's size checked against the
+                # volume before the atomic rename. A mismatch exits non-zero;
+                # the initContainer restarts and the .part cleanup above redoes
+                # the copy.
+                echo "[stage] copying the staged weights from the shared volume onto this node's NVMe ($PAR parallel streams)"
+                T0=$(date +%s)
+                ( while sleep 30; do
+                    echo "[stage] $(du -sm "$W"/*.part 2>/dev/null | awk '{s+=$1} END {print s+0}') MB on the NVMe after $(( $(date +%s) - T0 )) s"
+                  done ) &
+                PROGRESS=$!
+                for d in Kimi-K3-DSpark Kimi-K3; do
+                  rm -rf "$W/$d" "$W/$d.part"
+                  mkdir -p "$W/$d.part"
+                  (cd "$S/$d" && find . -type d -print0) | (cd "$W/$d.part" && xargs -0 mkdir -p)
+                  (cd "$S/$d" && find . ! -type d -print0) \
+                    | xargs -0 -P "$PAR" -I{} cp -d -p "$S/$d/{}" "$W/$d.part/{}"
+                  if ! cmp -s <(cd "$S/$d" && find . -type f -printf '%s %P\n' | sort) \
+                              <(cd "$W/$d.part" && find . -type f -printf '%s %P\n' | sort); then
+                    echo "[stage] the copy of $d does not match the volume; exiting so the copy is redone"
+                    kill "$PROGRESS" 2>/dev/null || true
+                    exit 1
+                  fi
+                  mv "$W/$d.part" "$W/$d"
+                done
+                kill "$PROGRESS" 2>/dev/null || true
+                require_model_licenses
+                echo "[stage] copied in $(( ($(date +%s) - T0) / 60 ))m $(( ($(date +%s) - T0) % 60 ))s: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+                exit 0
+              fi
+              echo "[stage] no weights on the shared volume — staging ~1.5TB from the Hub onto this node"
+              pip install --quiet --no-cache-dir 'huggingface_hub[cli]' hf_xet
+              export HF_XET_HIGH_PERFORMANCE=1
+              hf download Inferact/Kimi-K3-DSpark --local-dir "$W"/Kimi-K3-DSpark
+              hf download moonshotai/Kimi-K3      --local-dir "$W"/Kimi-K3
+              require_model_licenses
+              echo "[stage] done: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+          volumeMounts:
+            - {name: model, mountPath: /weights}
+            - {name: shared, mountPath: /shared, readOnly: true}
+        - name: infera-overlay
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
+          imagePullPolicy: IfNotPresent
+          command: ["sh","-c","cp -a /payload/. /overlay/"]
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay}
+      containers:
+        - name: main
+          image: johnqin2025/kimi-k3-dspark:1.1.0-mi355x-rocm7.2.3-20260802@sha256:5f3007aff1bc231eceb9f024e56ee80e44f9ca101a521aa50fe6bfa6c979d6b8
+          imagePullPolicy: IfNotPresent
+          # Arguments verbatim from ../pd-dspark/kimi-k3-pd-dspark.yaml (prefill
+          # role), which carries the rationale for every value.
+          command: ["/overlay/bin/infera-exec",
+                    "python3","-m","infera.engine.vllm","--host","0.0.0.0","--port","30000",
+                    "--model","/models/Kimi-K3",
+                    "--served-model-name","moonshotai/Kimi-K3",
+                    "--tensor-parallel-size","8",
+                    "--gpu-memory-utilization","0.88",
+                    "--trust-remote-code","--load-format","auto",
+                    "--mm-encoder-tp-mode","data","--kv-cache-dtype","auto",
+                    "--enable-prefix-caching",
+                    "--max-num-seqs","64","--max-num-batched-tokens","4096",
+                    "--max-model-len","1048576",
+                    "--enable-auto-tool-choice","--tool-call-parser","kimi_k3",
+                    "--reasoning-parser","kimi_k3",
+                    "--data-parallel-address","$(POD_IP)",
+                    "--speculative-config","{\"method\": \"dspark\", \"model\": \"/models/Kimi-K3-DSpark\", \"num_speculative_tokens\": 7, \"attention_backend\": \"ROCM_AITER_MLA\"}",
+                    "--kv-transfer-config","{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\"}",
+                    "--kv-event-transport","zmq","--request-transport","http"]
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: INFERA_REQUIRE_NATIVE, value: mooncake}
+            # The three Mooncake fabric pins (docs/03). Removing any one
+            # reproduces a silent KV-handoff hang.
+            - {name: MC_GID_INDEX, value: '1'}
+            - {name: MC_DISABLE_HIP_TRANSPORT, value: '1'}
+            - {name: MC_ENABLE_DEST_DEVICE_AFFINITY, value: '1'}
+            - {name: INFERA_ENGINE_READY_TIMEOUT, value: '7200'}
+            - {name: HF_HUB_OFFLINE, value: '1'}
+            - {name: SAFETENSORS_FAST_GPU, value: '1'}
+            - {name: VLLM_ROCM_USE_AITER, value: '1'}
+            - {name: VLLM_ROCM_USE_AITER_FP4BMM, value: '1'}
+            - {name: AITER_SITUV2_A8W4, value: '1'}
+            - {name: AITER_BF16_FP8_MOE_BOUND, value: '0'}
+            - {name: HIP_FORCE_DEV_KERNARG, value: '1'}
+            - {name: HSA_NO_SCRATCH_RECLAIM, value: '1'}
+            - {name: HSA_ENABLE_IPC_MODE_LEGACY, value: '1'}
+            - {name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: '0'}
+            - {name: VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION, value: '1'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_BF16, value: '0'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8, value: '1'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8, value: '1'}
+            - {name: KIMI_K3_DUAL_PROJ_FP8_WEIGHT_CACHE_MODIFIER, value: '2'}
+            - {name: KIMI_K3_SHARED_DOWN_FP8_WEIGHT_CACHE_MODIFIER, value: '2'}
+          ports:
+            - {name: http, containerPort: 30000}
+          # RDMA needs the device nodes and pinned memory.
+          securityContext:
+            privileged: true
+            capabilities: {add: ["IPC_LOCK","SYS_PTRACE"]}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 20"]
+          startupProbe:
+            httpGet: {path: /health, port: 30000}
+            periodSeconds: 10
+            timeoutSeconds: 10
+            # 600 x 10s = 100 min: weight load + graph capture + first-start
+            # AITER JIT build. A false give-up costs another full reload.
+            failureThreshold: 600
+          readinessProbe:
+            httpGet: {path: /health, port: 30000}
+            periodSeconds: 10
+            timeoutSeconds: 10
+          resources:
+            requests: {cpu: '32', memory: 512Gi, amd.com/gpu: 8}
+            # No memory limit: loading 1.5 TB of safetensors charges page
+            # cache to the cgroup and a limit can OOM-kill mid-load.
+            limits: {cpu: '32', amd.com/gpu: 8}
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay, readOnly: true}
+            - {name: model, mountPath: /models, readOnly: true}
+            # The vendor base's libionic must match the host ionic kernel ABI
+            # (docs/03); infera-exec swaps it in from here.
+            - {name: host-libionic, mountPath: /host-libionic/libionic.so, readOnly: true}
+            - {name: ib, mountPath: /dev/infiniband}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: overlay, emptyDir: {}}
+        - name: model
+          # DirectoryOrCreate: a freshly joined node has no weights dir yet.
+          hostPath: {path: /mnt/nvme/kimi-k3/weights, type: DirectoryOrCreate}
+        - name: shared
+          # no type: only the initContainer reads it; a cluster without the
+          # volume falls through to the Hub download.
+          hostPath: {path: /mnt/shared}
+        - name: host-libionic
+          hostPath: {path: /usr/lib/x86_64-linux-gnu/libionic.so.1, type: File}
+        - {name: ib, hostPath: {path: /dev/infiniband, type: Directory}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}
+---
+# ============================== DECODE =====================================
+# Identical to PREFILL except: replicas, the component/service labels, and
+# kv_role kv_consumer. --speculative-config stays on BOTH roles (docs/03).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-k3-decode
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-infera
+    app.kubernetes.io/component: decode
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  progressDeadlineSeconds: 14400
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kimi-k3-infera
+      app.kubernetes.io/component: decode
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kimi-k3-infera
+        app.kubernetes.io/component: decode
+        app.kubernetes.io/part-of: kimi-k3
+        infera.amd.com/service: decode
+    spec:
+      serviceAccountName: kimi-k3-serving
+      tolerations:
+        - {key: amd.com/gpu, operator: Equal, value: present, effect: NoSchedule}
+      nodeSelector:
+        node-role.kubernetes.io/gpu-worker: ""
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 180
+      initContainers:
+        - name: stage-weights
+          image: python:3.12-slim
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              W=/weights
+              S=/shared/kimi-k3/weights
+              PAR=32   # parallel copy streams from the volume (see the copy step)
+              complete() {
+                [ "$(ls "$1"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)" -ge 96 ] \
+                  && [ -f "$1"/Kimi-K3-DSpark/config.json ]
+              }
+              require_model_licenses() {
+                for model_dir in "$W"/Kimi-K3 "$W"/Kimi-K3-DSpark; do
+                  if [ ! -s "$model_dir/LICENSE" ]; then
+                    echo "[stage] FATAL: missing model license: $model_dir/LICENSE" >&2
+                    echo "[stage] Restore the LICENSE from the model's exact upstream revision." >&2
+                    exit 1
+                  fi
+                done
+              }
+              for d in Kimi-K3 Kimi-K3-DSpark; do
+                if [ -L "$W/$d" ]; then rm -f "$W/$d"; fi
+                rm -rf "$W/$d.part"
+              done
+              if complete "$W"; then
+                require_model_licenses
+                echo "[stage] main model + DSpark draft present on this node"; exit 0
+              fi
+              fresh() {
+                [ -f "$S/.staging" ] \
+                  && [ $(( $(date +%s) - $(stat -c %Y "$S/.staging") )) -lt 600 ]
+              }
+              while fresh && [ ! -f "$S/.complete" ]; do
+                echo "[stage] shared volume download in progress: $(ls "$S"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)/96 shards"
+                sleep 60
+              done
+              if [ -f "$S/.complete" ] && complete "$S"; then
+                # Parallel copy. One `cp -a` stream reads the volume at about
+                # 0.55 GB/s (45 minutes for 1.5 TB); 32 files at once read it
+                # at about 14 GB/s on an MI355X node (measured 2026-09-09 on a
+                # VAST export with nconnect=16, RAID10 NVMe: 1.5 TB in about 2
+                # minutes). Directory tree first, then every file and symlink
+                # through xargs -P, then every file's size checked against the
+                # volume before the atomic rename. A mismatch exits non-zero;
+                # the initContainer restarts and the .part cleanup above redoes
+                # the copy.
+                echo "[stage] copying the staged weights from the shared volume onto this node's NVMe ($PAR parallel streams)"
+                T0=$(date +%s)
+                ( while sleep 30; do
+                    echo "[stage] $(du -sm "$W"/*.part 2>/dev/null | awk '{s+=$1} END {print s+0}') MB on the NVMe after $(( $(date +%s) - T0 )) s"
+                  done ) &
+                PROGRESS=$!
+                for d in Kimi-K3-DSpark Kimi-K3; do
+                  rm -rf "$W/$d" "$W/$d.part"
+                  mkdir -p "$W/$d.part"
+                  (cd "$S/$d" && find . -type d -print0) | (cd "$W/$d.part" && xargs -0 mkdir -p)
+                  (cd "$S/$d" && find . ! -type d -print0) \
+                    | xargs -0 -P "$PAR" -I{} cp -d -p "$S/$d/{}" "$W/$d.part/{}"
+                  if ! cmp -s <(cd "$S/$d" && find . -type f -printf '%s %P\n' | sort) \
+                              <(cd "$W/$d.part" && find . -type f -printf '%s %P\n' | sort); then
+                    echo "[stage] the copy of $d does not match the volume; exiting so the copy is redone"
+                    kill "$PROGRESS" 2>/dev/null || true
+                    exit 1
+                  fi
+                  mv "$W/$d.part" "$W/$d"
+                done
+                kill "$PROGRESS" 2>/dev/null || true
+                require_model_licenses
+                echo "[stage] copied in $(( ($(date +%s) - T0) / 60 ))m $(( ($(date +%s) - T0) % 60 ))s: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+                exit 0
+              fi
+              echo "[stage] no weights on the shared volume — staging ~1.5TB from the Hub onto this node"
+              pip install --quiet --no-cache-dir 'huggingface_hub[cli]' hf_xet
+              export HF_XET_HIGH_PERFORMANCE=1
+              hf download Inferact/Kimi-K3-DSpark --local-dir "$W"/Kimi-K3-DSpark
+              hf download moonshotai/Kimi-K3      --local-dir "$W"/Kimi-K3
+              require_model_licenses
+              echo "[stage] done: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+          volumeMounts:
+            - {name: model, mountPath: /weights}
+            - {name: shared, mountPath: /shared, readOnly: true}
+        - name: infera-overlay
+          image: inferaimage/infera-overlay:v0.2.9@sha256:90e822bc207e337b67cb387807c6fb8c4a038d9a88a0d10cacb458f853a68be3
+          imagePullPolicy: IfNotPresent
+          command: ["sh","-c","cp -a /payload/. /overlay/"]
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay}
+      containers:
+        - name: main
+          image: johnqin2025/kimi-k3-dspark:1.1.0-mi355x-rocm7.2.3-20260802@sha256:5f3007aff1bc231eceb9f024e56ee80e44f9ca101a521aa50fe6bfa6c979d6b8
+          imagePullPolicy: IfNotPresent
+          command: ["/overlay/bin/infera-exec",
+                    "python3","-m","infera.engine.vllm","--host","0.0.0.0","--port","30000",
+                    "--model","/models/Kimi-K3",
+                    "--served-model-name","moonshotai/Kimi-K3",
+                    "--tensor-parallel-size","8",
+                    "--gpu-memory-utilization","0.88",
+                    "--trust-remote-code","--load-format","auto",
+                    "--mm-encoder-tp-mode","data","--kv-cache-dtype","auto",
+                    "--max-num-seqs","64","--max-num-batched-tokens","4096",
+                    "--max-model-len","1048576",
+                    "--enable-auto-tool-choice","--tool-call-parser","kimi_k3",
+                    "--reasoning-parser","kimi_k3",
+                    "--data-parallel-address","$(POD_IP)",
+                    "--speculative-config","{\"method\": \"dspark\", \"model\": \"/models/Kimi-K3-DSpark\", \"num_speculative_tokens\": 7, \"attention_backend\": \"ROCM_AITER_MLA\"}",
+                    "--kv-transfer-config","{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_consumer\"}",
+                    "--kv-event-transport","zmq","--request-transport","http"]
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            - {name: INFERA_REQUIRE_NATIVE, value: mooncake}
+            - {name: MC_GID_INDEX, value: '1'}
+            - {name: MC_DISABLE_HIP_TRANSPORT, value: '1'}
+            - {name: MC_ENABLE_DEST_DEVICE_AFFINITY, value: '1'}
+            - {name: INFERA_ENGINE_READY_TIMEOUT, value: '7200'}
+            - {name: HF_HUB_OFFLINE, value: '1'}
+            - {name: SAFETENSORS_FAST_GPU, value: '1'}
+            - {name: VLLM_ROCM_USE_AITER, value: '1'}
+            - {name: VLLM_ROCM_USE_AITER_FP4BMM, value: '1'}
+            - {name: AITER_SITUV2_A8W4, value: '1'}
+            - {name: AITER_BF16_FP8_MOE_BOUND, value: '0'}
+            - {name: HIP_FORCE_DEV_KERNARG, value: '1'}
+            - {name: HSA_NO_SCRATCH_RECLAIM, value: '1'}
+            - {name: HSA_ENABLE_IPC_MODE_LEGACY, value: '1'}
+            - {name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: '0'}
+            - {name: VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION, value: '1'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_BF16, value: '0'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_PREROUTE_FP8, value: '1'}
+            - {name: VLLM_ROCM_USE_KIMI_K3_LATENT_TAIL_FP8, value: '1'}
+            - {name: KIMI_K3_DUAL_PROJ_FP8_WEIGHT_CACHE_MODIFIER, value: '2'}
+            - {name: KIMI_K3_SHARED_DOWN_FP8_WEIGHT_CACHE_MODIFIER, value: '2'}
+          ports:
+            - {name: http, containerPort: 30000}
+          securityContext:
+            privileged: true
+            capabilities: {add: ["IPC_LOCK","SYS_PTRACE"]}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","sleep 20"]
+          startupProbe:
+            httpGet: {path: /health, port: 30000}
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 600
+          readinessProbe:
+            httpGet: {path: /health, port: 30000}
+            periodSeconds: 10
+            timeoutSeconds: 10
+          resources:
+            requests: {cpu: '32', memory: 512Gi, amd.com/gpu: 8}
+            limits: {cpu: '32', amd.com/gpu: 8}
+          volumeMounts:
+            - {name: overlay, mountPath: /overlay, readOnly: true}
+            - {name: model, mountPath: /models, readOnly: true}
+            - {name: host-libionic, mountPath: /host-libionic/libionic.so, readOnly: true}
+            - {name: ib, mountPath: /dev/infiniband}
+            - {name: dshm, mountPath: /dev/shm}
+      volumes:
+        - {name: overlay, emptyDir: {}}
+        - name: model
+          hostPath: {path: /mnt/nvme/kimi-k3/weights, type: DirectoryOrCreate}
+        - name: shared
+          hostPath: {path: /mnt/shared}
+        - name: host-libionic
+          hostPath: {path: /usr/lib/x86_64-linux-gnu/libionic.so.1, type: File}
+        - {name: ib, hostPath: {path: /dev/infiniband, type: Directory}}
+        - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 64Gi}}

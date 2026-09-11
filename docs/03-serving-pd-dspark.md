@@ -11,6 +11,11 @@ prerequisite (GPU-direct RDMA / peer memory) that aggregated serving does not.
 If you have fewer than 3 GPU nodes or do not need PD, use
 [02-serving-aggregated.md](02-serving-aggregated.md) instead.
 
+On a **market (dynamic) cluster** the same roles ship as plain Deployments in
+`k8s/market/pd-dspark.yaml` (no operator, no hostnames, weights from the shared
+volume); see [07-market-clusters.md](07-market-clusters.md). This doc's
+fabric and engine facts apply unchanged.
+
 ## Architecture
 
 Disaggregation here is **not** vLLM-native distributed inference. Vanilla

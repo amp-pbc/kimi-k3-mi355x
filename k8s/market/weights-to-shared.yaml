@@ -1,0 +1,151 @@
+# Kimi K3 weights onto the cluster's shared volume: the Getting Started
+# Serve path's "Stage the weights" step (seb 2026-09-08).
+#
+# MARKET (dynamic) clusters: this file is the same Job the National Compute
+# Getting Started page serves at
+#   https://nationalcompute.com/first-job/kimi-k3-weights-to-shared.yaml
+# (grid-interconnect examples/first-job). It is kept here so the recipe is
+# self-contained; if the two drift, the served copy is the one the page tests.
+# See ../../docs/07-market-clusters.md for where it fits.
+#
+# Run this as soon as the cluster exists, then launch the serving recipe
+# right away. The Job runs on the CPU worker, which is there from the first
+# minute, so the 1.5 TB download proceeds while the serving worker's pending
+# pod pulls the first GPU node in. The serving worker
+# (kimi-k3-serve-amd.yaml) waits for this Job while it runs and copies the
+# weights from the volume onto the node's NVMe once they are complete there,
+# so nothing is downloaded from the Hub twice. Pre staging data on the shared
+# volume is the pattern for any large dataset or checkpoint: the volume
+# outlives every node.
+#
+# Layout on the volume (the layout the serving worker keeps on node NVMe):
+#   /mnt/shared/kimi-k3/weights/Kimi-K3          96 safetensors shards
+#   /mnt/shared/kimi-k3/weights/Kimi-K3-DSpark   the speculative decoding draft
+#   /mnt/shared/kimi-k3/weights/.staging         heartbeat while this Job runs
+#   /mnt/shared/kimi-k3/weights/.complete        written when both are complete
+#
+# The heartbeat stays across a failed attempt (the Job retries and the
+# serving worker keeps waiting). It goes when the download completes or when
+# the Job is deleted, and the serving worker treats a heartbeat older than
+# 10 minutes as gone.
+#
+# Needs about 1.5 TB (1500 GiB) free on the volume. Clusters built after the
+# volume default rose to 2 TiB carry room for it; a 1 TiB volume cannot hold
+# the checkpoint, and the Job fails once, without retries, saying so.
+#
+# Writes go to a hard NFS mount. The download runs with 4 workers and without
+# the Xet high performance mode: a heavier writer wedged a CPU worker's NFS
+# writeback on 2026-09-08.
+#
+#   kubectl apply -f https://nationalcompute.com/first-job/kimi-k3-weights-to-shared.yaml
+#   kubectl logs -f job/kimi-k3-weights
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-weights
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  # hf download resumes finished shards, so a failed attempt continues from
+  # the last complete file
+  backoffLimit: 20
+  # exit 3 = the volume cannot hold the checkpoint: fail the Job at once
+  # instead of retrying 20 times over an hour
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes:
+          containerName: download
+          operator: In
+          values: [3]
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      # Never (podFailurePolicy needs it): each retry is a fresh pod
+      restartPolicy: Never
+      # The CPU worker: present from the first minute, no GPU, mounts the
+      # shared volume like every node (node-role.kubernetes.io/cpu, no taint)
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      containers:
+        - name: download
+          image: python:3.12-slim
+          env:
+            - {name: TARGET_REPO, value: moonshotai/Kimi-K3}
+            - {name: DRAFT_REPO, value: Inferact/Kimi-K3-DSpark}
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              W=/shared/kimi-k3/weights
+              mkdir -p "$W"
+              complete() {
+                [ "$(ls "$1"/Kimi-K3/*.safetensors 2>/dev/null | wc -l)" -ge 96 ] \
+                  && [ -f "$1"/Kimi-K3-DSpark/config.json ]
+              }
+              if complete "$W"; then
+                echo "[stage] main model + DSpark draft already on the shared volume"
+                touch "$W/.complete"
+                rm -f "$W/.staging"
+                exit 0
+              fi
+              # leftovers of a killed attempt: hf names each temp file with a
+              # fresh id, so these never resume and only eat space (this Job
+              # is the volume's only writer)
+              find "$W" -name '*.incomplete' -delete 2>/dev/null || true
+              AVAIL_GIB=$(df -BG --output=avail "$W" | tail -1 | tr -dc '0-9')
+              SIZE_GIB=$(df -BG --output=size "$W" | tail -1 | tr -dc '0-9')
+              HAVE_GIB=$(du -sBG "$W" | cut -f1 | tr -dc '0-9')
+              NEED_GIB=$((1500 - HAVE_GIB))
+              if [ "$AVAIL_GIB" -lt "$NEED_GIB" ]; then
+                echo "[stage] FATAL: ${AVAIL_GIB} GiB free on the shared volume, about ${NEED_GIB} GiB more needed for the checkpoint." >&2
+                if [ "$SIZE_GIB" -lt 2000 ]; then
+                  echo "[stage] This volume is ${SIZE_GIB} GiB. A 1 TiB volume cannot hold the 1.5 TB checkpoint. Ask support to resize it to 2 TiB." >&2
+                else
+                  echo "[stage] Free space on the volume, then apply this Job again." >&2
+                fi
+                exit 3
+              fi
+              echo "[stage] ${AVAIL_GIB} GiB free, staging onto the shared volume"
+              rm -f "$W/.complete"
+              touch "$W/.staging"
+              ( while true; do sleep 60; touch "$W/.staging" 2>/dev/null || true; done ) &
+              HB=$!
+              DL=
+              # a failed attempt keeps .staging (the Job retries); a delete
+              # (TERM) removes it so the serving worker stops waiting
+              trap 'kill "$HB" 2>/dev/null || true' EXIT
+              trap 'echo "[stage] stopping"; kill "$DL" "$HB" 2>/dev/null || true; rm -f "$W/.staging"; exit 143' TERM INT
+              pip install --quiet --no-cache-dir 'huggingface_hub[cli]' hf_xet
+              dl() {
+                hf download "$1" --local-dir "$2" --max-workers 4 &
+                DL=$!
+                wait "$DL"
+              }
+              echo "[stage] ${DRAFT_REPO} (small, validates the path first)"
+              dl "$DRAFT_REPO" "$W/Kimi-K3-DSpark"
+              echo "[stage] ${TARGET_REPO} (about 1.5 TB, the long one)"
+              dl "$TARGET_REPO" "$W/Kimi-K3"
+              echo "[stage] done: $(ls "$W"/Kimi-K3/*.safetensors | wc -l) shards"
+              du -sh "$W/Kimi-K3" "$W/Kimi-K3-DSpark" || true
+              touch "$W/.complete"
+              rm -f "$W/.staging"
+          resources:
+            # network bound: small requests so it fits beside the router on
+            # the 16 vCPU CPU worker; no CPU limit so the download can use
+            # idle cores
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {memory: 16Gi}
+          volumeMounts:
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: shared
+          # type Directory: this Job is for clusters WITH the shared volume.
+          # On a node without it the pod fails to start with a clear mount
+          # error instead of filling the node's root disk.
+          hostPath: {path: /mnt/shared, type: Directory}

@@ -1,0 +1,637 @@
+# Routing/performance validation: session reuse is causal, interrupted streams
+# count as failures, and an unfinished drain stops the sweep. The synthetic
+# session selection still depends on response timing and caches persist.
+# Use the fixed-request replay in docs/09-controlled-rerun.md for matched
+# policy comparisons; record fresh-prefix/warm state and per-worker counters.
+# See https://github.com/amp-pbc/kimi-k3-mi355x/blob/main/docs/09-controlled-rerun.md
+#
+# Load test for a Kimi-K3 endpoint from INSIDE the cluster: bench/orbench.py
+# (methodology in docs/05) as a Job on the CPU worker, the script shipped
+# verbatim in a ConfigMap so nothing has to be copied onto a node. Offers the
+# router an open-loop request RATE (Poisson arrivals) across the realistic
+# traffic mix and prints what a router displays and routes on: median
+# per-request tok/s (output tokens over total time, TTFT included), TTFT
+# p50/p90/p99, completion rate, 429 count — per offered rate, then the
+# rate-vs-stats table and the per-slice breakdown.
+#
+#   kubectl apply -f k8s/market/loadtest.yaml
+#   kubectl logs -f job/kimi-k3-loadtest
+#
+# Hits http://infera:8000 over the pod network — never through a
+# port-forward (bench/README.md). Offers no load until the deployment is
+# FULLY up: every worker pod Ready (Kubernetes API, the recipe's
+# kimi-k3-serving ServiceAccount) and discovered by the router (/v1/workers),
+# both roles present for PD — the router answers 503 until one prefill and
+# one decode worker are up, and a test that starts before the last worker
+# measures a smaller deployment than you paid for. Prints "workers ready:
+# N/M" every 30 s while waiting.
+#
+# One Job for the one-node aggregated recipe and the six-node PD one alike
+# (same router at infera:8000, same worker label). The sweep follows the
+# deployment it finds when RATES is left empty: one worker gets 0.25, 0.5, 1
+# and 2 req/s, more workers get 0.5, 1, 2 and 4 — a single TP8 node saturates
+# below the rate six nodes do, and a sweep that starts past the knee shows
+# only the backlog. Either way 120 s per rate after a 60 s warm-up, 120 s
+# drain between rates: about 17 minutes. Set RATES, SECS, WARM and DRAIN
+# below to sweep differently.
+#
+# The RESULTS OUTLIVE THIS JOB on clusters with a shared volume: the full
+# console output lands at /mnt/shared/kimi-k3/loadtest/orbench-<time>.log
+# with the per-request CSV beside it, and latest.log / latest.csv point at
+# the newest run. The Job itself stays for an hour after it finishes (its
+# pod's log with it); after that, or any time, read a run with the results
+# reader Job (k8s/market/loadtest-results.yaml). To run the test again while the Job
+# still exists, delete it first (a Job's pod template is immutable).
+#
+# Same file as the National Compute Getting Started
+# first-job/kimi-k3-loadtest.yaml; keep the two in step.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-k3-loadtest
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: kimi-k3
+data:
+  orbench.py: |
+    """OpenRouter-representative load test: OPEN-LOOP, mixed traffic, scored on
+    what a router actually displays and routes on (median throughput + latency).
+
+    WHY OPEN-LOOP
+    A closed-loop test uses a fixed number of workers that each wait for a response
+    before sending again. That self-throttles: it can never overload the system and
+    so can never find the rate at which the endpoint starts failing. A router does
+    not send an endpoint a concurrency, it sends a RATE. This harness drives Poisson
+    arrivals at a target rate regardless of what is already in flight, and sweeps the
+    rate to find the knee.
+
+    WHAT THIS MEASURES AND WHY
+     - Token lengths are SAMPLED from a heavy-tailed mix (short chat / agentic /
+       long-context), not fixed. Fixed sizes make runs non-comparable (matched
+       prompts but wildly different completion lengths change the answer).
+     - Agentic traffic runs MULTI-TURN SESSIONS whose prefix grows each turn, so
+       prefix reuse is organic and partial rather than an artificial 0% or 100%.
+     - 429s are NOT retried. In open loop a 429 is a request the user did not get
+       served, which is exactly how a router would see it.
+     - Scored on the ROUTER VIEW: median per-request throughput (output tokens /
+       total time incl TTFT — the displayed number), TTFT percentiles (the latency
+       stat), completion rate (uptime proxy), and 429 count. There is NO pass/fail
+       goodput gate: a fixed threshold condemns short-output tool traffic that is
+       being served in ~1s, and a router has no such gate either — it displays
+       medians and routes on them. Tokens/sec is reported but is deliberately not
+       the headline, because it rewards long generations and punishes fast short
+       ones.
+
+    OUTPUT: one row per request to CSV, a per-rate summary, and a rate-vs-displayed-
+    stats curve to read the advertisable rate off.
+
+    CONFIG (all via env, with generic defaults):
+      ORBENCH_BASE   chat-completions URL (default a local placeholder)
+      API_KEY        bearer token; empty = no auth (many engines require none)
+      ORBENCH_MODEL  model id (default moonshotai/kimi-k3)
+    """
+    import argparse, asyncio, csv, json, math, os, random, statistics as st, time
+    import httpx
+
+    # Overridable so the bench survives endpoint moves and can aim at an in-cluster
+    # target (e.g. as a Job). API_KEY falls back to empty: engines that do no auth
+    # accept an empty bearer. Note the model id can differ by target — a gateway
+    # may serve a public id while the engine is started with a --served-model-name.
+    BASE = os.environ.get("ORBENCH_BASE", "http://localhost:8000/v1/chat/completions")
+    KEY  = os.environ.get("API_KEY", "")
+    MODEL = os.environ.get("ORBENCH_MODEL", "moonshotai/kimi-k3")
+
+    # TTFT and per-request throughput are the two things a router displays, so those
+    # are what we report. SLA is scored the way a router computes throughput: output
+    # tokens divided by TOTAL wall time INCLUDING TTFT. That single view is the right
+    # one, because it already penalises slow prefill without pretending a 100k-token
+    # prompt can deliver a first token in 2s. An absolute TTFT gate would score
+    # physics as failure (long prompts legitimately have high TTFT). TTFT is still
+    # reported in full, it just does not gate the score.
+
+    WORDS = [f"w{i:05d}" for i in range(80000)]
+    TOK_PER_WORD = 3.0          # measured: synthetic 6-char tokens cost ~3 tokens each
+
+    # Traffic mix. Shares sum to 1. Ranges are lognormal-ish via triangular sampling
+    # so the tail is heavier than uniform without being absurd.
+    SLICES = [
+        # name        share  prompt_lo  prompt_mode  prompt_hi   out_lo out_hi  session?
+        ("chat",      0.60,      200,       800,        2000,      100,   800,  False),
+        ("agentic",   0.30,     4000,      8000,       32000,      200,  2000,  True),
+        ("longctx",   0.10,    32000,     60000,      200000,      200,  2000,  False),
+    ]
+
+    def pick_slice(rng):
+        x = rng.random(); acc = 0.0
+        for s in SLICES:
+            acc += s[1]
+            if x <= acc: return s
+        return SLICES[-1]
+
+    def words_for(tokens): return max(4, int(tokens / TOK_PER_WORD))
+
+    def filler(rng, tokens):
+        return " ".join(rng.choice(WORDS) for _ in range(words_for(tokens)))
+
+
+    class Sessions:
+        """Multi-turn conversations whose prefix GROWS, producing organic reuse.
+
+        Turn 1 sends a system context plus a question. Turn 2 sends the same context,
+        the assistant's reply, and a new question, so the cached prefix lengthens each
+        turn exactly as a coding agent's does. Sessions retire after a few turns so
+        the working set keeps churning instead of going permanently hot.
+        """
+        def __init__(self, rng):
+            self.rng = rng
+            self.pool = {}
+            self.next_id = 0
+
+        def take(self, prompt_tokens):
+            live = [k for k, v in self.pool.items()
+                    if not v["busy"] and len(v["msgs"]) < 2 * v["max_turns"]]
+            if live and self.rng.random() < 0.75:
+                k = self.rng.choice(live)
+                s = self.pool[k]
+                s["busy"] = True
+                s["msgs"].append({"role": "user",
+                                  "content": f"Turn {len(s['msgs'])//2+1}: continue, one short paragraph."})
+                return k, list(s["msgs"])
+            k = self.next_id; self.next_id += 1
+            base = [{"role": "system", "content": "PROJECT CONTEXT:\n" + filler(self.rng, prompt_tokens)},
+                    {"role": "user", "content": "Turn 1: summarise the context in one short paragraph."}]
+            self.pool[k] = {"msgs": list(base), "max_turns": self.rng.randint(2, 6), "busy": True}
+            if len(self.pool) > 60:
+                for old in [key for key, value in self.pool.items() if not value["busy"]][:20]:
+                    self.pool.pop(old, None)
+            return k, list(base)
+
+        def record_reply(self, k, reply):
+            if k in self.pool:
+                self.pool[k]["msgs"].append(reply)
+                self.pool[k]["busy"] = False
+
+        def discard(self, k):
+            self.pool.pop(k, None)
+
+
+    class Bench:
+        def __init__(self, csv_path):
+            self.rows = []
+            self.inflight = 0
+            self.peak_inflight = 0
+            self.offered = {}
+            self.durations = {}
+            self.f = open(csv_path, "w", newline="")
+            self.w = csv.writer(self.f)
+            self.w.writerow(["ts","rate","slice","session","turn","status","ttft_s","total_s",
+                             "prompt_tokens","completion_tokens","tok_per_s","completed","err"])
+            self.f.flush()
+
+        def add(self, **kw):
+            self.rows.append(kw)
+            self.w.writerow([f"{kw['ts']:.3f}", kw["rate"], kw["slice"], kw["session"], kw["turn"],
+                             kw["status"], "" if kw["ttft_s"] is None else f"{kw['ttft_s']:.3f}",
+                             f"{kw['total_s']:.3f}", kw["prompt_tokens"] or "", kw["completion_tokens"] or "",
+                             "" if kw["tok_per_s"] is None else f"{kw['tok_per_s']:.2f}",
+                             int(kw["completed"]), kw["err"] or ""])
+            self.f.flush()
+
+
+    async def one_request(client, bench, rate, rng, sessions, request=None):
+        if request is None:
+            name, _, plo, pmode, phi, olo, ohi, use_session = pick_slice(rng)
+            ptok = int(rng.triangular(plo, phi, pmode))
+            otok = rng.randint(olo, ohi)
+            sess, turn = -1, 0
+            if use_session:
+                sess, msgs = sessions.take(ptok)
+                turn = len(msgs) // 2
+            else:
+                msgs = [{"role": "user", "content": filler(rng, ptok)}]
+            body = {"model": MODEL, "messages": msgs, "max_tokens": otok}
+        else:
+            # A recorded request fixes prompt content independently of responses.
+            name = request.get("slice", "replay")
+            sess, turn = request["session"], request["turn"]
+            use_session = False
+            body = dict(request["body"])
+        body.update(stream=True, stream_options={"include_usage": True})
+
+        bench.inflight += 1
+        bench.offered[rate] = bench.offered.get(rate, 0) + 1
+        bench.peak_inflight = max(bench.peak_inflight, bench.inflight)
+        t0 = time.monotonic(); first = None; usage = None; err = None; code = 0
+        reply = {"role": "assistant", "content": ""}
+        stream_done = False; finished = False; cancelled = False
+        headers = {"Authorization": f"Bearer {KEY}"} if KEY else {}
+        try:
+            async with client.stream("POST", BASE, json=body, headers=headers) as r:
+                code = r.status_code
+                if code != 200:
+                    err = f"http{code}"; await r.aread()
+                else:
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"): continue
+                        p = line[5:].strip()
+                        if p == "[DONE]":
+                            stream_done = True
+                            break
+                        try:
+                            d = json.loads(p)
+                            if d.get("error"):
+                                err = "stream_error"
+                                break
+                            if d.get("usage"):
+                                usage = d["usage"]
+                                if not isinstance(usage, dict):
+                                    raise ValueError("invalid usage")
+                                for key in ("completion_tokens", "prompt_tokens"):
+                                    value = usage.get(key)
+                                    if value is not None and (not isinstance(value, int) or value < 0):
+                                        raise ValueError("invalid token count")
+                            ch = d.get("choices") or []
+                            if ch:
+                                delta = ch[0].get("delta", {})
+                                if ch[0].get("finish_reason") is not None:
+                                    finished = True
+                                # Role/usage events are not generated tokens.
+                                if first is None and any(delta.get(k) for k in
+                                        ("content", "reasoning", "reasoning_content", "tool_calls")):
+                                    first = time.monotonic() - t0
+                                for key in ("content", "reasoning", "reasoning_content"):
+                                    if delta.get(key):
+                                        reply[key] = reply.get(key, "") + delta[key]
+                        except (ValueError, TypeError, AttributeError, KeyError):
+                            usage = None
+                            err = "invalid_stream"
+                            break
+        except asyncio.CancelledError:
+            err = "cancelled_unfinished"
+            cancelled = True
+        except Exception as e:
+            err = type(e).__name__
+        finally:
+            bench.inflight -= 1
+
+        total = time.monotonic() - t0
+        ct = (usage or {}).get("completion_tokens")
+        # Router's definition: output tokens / TOTAL time, TTFT included.
+        ok = bool(code == 200 and stream_done and finished and err is None)
+        if not ok and err is None:
+            err = "incomplete_stream"
+        tps = (ct / max(total, 1e-6)) if ok and ct else None
+        if use_session:
+            if ok: sessions.record_reply(sess, reply)
+            else: sessions.discard(sess)
+        bench.add(ts=time.time(), rate=rate, slice=name, session=sess, turn=turn, status=code,
+                  ttft_s=first, total_s=total, prompt_tokens=(usage or {}).get("prompt_tokens"),
+                  completion_tokens=ct, tok_per_s=tps, completed=ok, err=err)
+        if cancelled:
+            raise asyncio.CancelledError
+        return ok
+
+
+    async def run_rate(client, bench, rate, secs, rng, sessions, drain_s, arrival=None):
+        """Poisson arrivals at `rate` req/s for `secs`, then drain."""
+        tasks = []
+        bench.durations[rate] = secs
+        t0 = time.time(); start = time.monotonic(); nxt_log = start + 30
+        # Separate arrivals from workload sampling, so responses do not consume
+        # the PRNG state that defines the arrival schedule.
+        arrival_rng = random.Random(rng.getrandbits(64))
+        next_arrival = start
+        while True:
+            next_arrival += arrival_rng.expovariate(arrival if arrival is not None else rate)
+            if next_arrival >= start + secs:
+                break
+            await asyncio.sleep(max(0, next_arrival - time.monotonic()))
+            tasks.append(asyncio.create_task(one_request(client, bench, rate, rng, sessions)))
+            if time.monotonic() >= nxt_log:
+                # Single pass over the rows for the progress line (avoids a quadratic
+                # multi-scan over a long run).
+                n = g = f429 = 0
+                tp = []
+                for r in bench.rows:
+                    if r["rate"] != rate:
+                        continue
+                    n += 1
+                    if r["completed"]:
+                        g += 1
+                    if r["status"] == 429:
+                        f429 += 1
+                    if r["tok_per_s"]:
+                        tp.append(r["tok_per_s"])
+                med = st.median(tp) if tp else 0.0
+                n = bench.offered.get(rate, 0)
+                print(f"    rate={rate:<4.1f} +{(time.monotonic()-start)/60:4.1f}m  offered={n:5d} "
+                      f"completed={100*g/max(n,1):5.1f}%  med tok/s={med:5.1f}  429={f429:4d}  inflight={bench.inflight:4d}",
+                      flush=True)
+                nxt_log += 30
+        await asyncio.sleep(max(0, start + secs - time.monotonic()))
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=drain_s)
+            for task in pending:
+                task.cancel()
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            if pending:
+                # Closing clients does not prove the server has stopped work.
+                # Abort the sweep instead of contaminating the next arm.
+                raise RuntimeError(f"drain_timeout: {len(pending)} unfinished requests; "
+                                   "sweep stopped, verify engine queues before another run")
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    raise outcome
+        return t0
+
+
+    def pct(xs, p):
+        if not xs: return 0.0
+        xs = sorted(xs); return xs[min(int(len(xs) * p), len(xs) - 1)]
+
+
+    def summarise(bench, rate, t0):
+        g = [r for r in bench.rows if r["rate"] == rate]
+        if not g: return None
+        done = [r for r in g if r["completed"]]
+        r429 = [r for r in g if r["status"] == 429]
+        othererr = [r for r in g if not r["completed"] and r["status"] != 429]
+        wall = max(1e-6, bench.durations.get(rate, 0), max(r["ts"] for r in g) - t0)
+        offered_window = max(1e-6, bench.durations.get(rate, wall))
+        outtok = sum((r["completion_tokens"] or 0) for r in done)
+        intok = sum((r["prompt_tokens"] or 0) for r in done)
+        tt = [r["ttft_s"] for r in done if r["ttft_s"] is not None]
+        speeds = [r["tok_per_s"] for r in done if r["tok_per_s"] is not None]
+        return dict(rate=rate, offered=len(g), offered_rps=len(g)/offered_window, completed=len(done),
+                    completed_pct=100*len(done)/len(g), r429=len(r429), othererr=len(othererr),
+                    out_tps=outtok/wall, in_tps=intok/wall,
+                    ttft_p50=pct(tt,.50), ttft_p90=pct(tt,.90), ttft_p99=pct(tt,.99),
+                    med_tok_s=st.median(speeds) if speeds else 0)
+
+
+    async def main():
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--rates", default="1,2,3,4,6,8")
+        ap.add_argument("--secs", type=int, default=240)
+        ap.add_argument("--warm", type=int, default=120)
+        ap.add_argument("--drain", type=int, default=180)
+        ap.add_argument("--csv", default="./orbench.csv")
+        ap.add_argument("--seed", type=int, default=20260804)
+        a = ap.parse_args()
+        rates = [float(x) for x in a.rates.split(",")]
+        if not rates or any(not math.isfinite(x) or x <= 0 for x in rates) or a.secs <= 0 or a.warm < 0 or a.drain <= 0:
+            ap.error("rates, secs and drain must be positive; warm must be nonnegative")
+        if len(set(rates)) != len(rates):
+            ap.error("duplicate rates are ambiguous; use separate runs")
+        rng = random.Random(a.seed)
+        sessions = Sessions(rng)
+        bench = Bench(a.csv)
+
+        print(f"OPEN-LOOP Poisson arrivals · rates {rates} req/s · {a.secs}s each · warm {a.warm}s")
+        print("scoring: router view — median tok/s per request (output/total time,"
+              " TTFT included), TTFT percentiles, completion rate, 429s")
+        print("mix: 60% chat 200-2k, 30% agentic 4k-32k multi-turn (growing prefix), 10% longctx 32k-200k")
+        print(f"CSV -> {a.csv}\n", flush=True)
+        print(f"seed={a.seed}; engine cache is NOT reset between runs", flush=True)
+
+        limits = httpx.Limits(max_connections=2000, max_keepalive_connections=400)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(900.0), limits=limits) as client:
+            print(f"warm-up {a.warm}s at {rates[0]} req/s (discarded)", flush=True)
+            # tag -1.0 so the rows are discardable, but ARRIVE at a real rate.
+            # Passing -1.0 as the rate would make expovariate return negatives, so
+            # sleep() returns instantly and the warm-up floods the endpoint, leaving
+            # every measured phase to start from a saturated backlog.
+            await run_rate(client, bench, -1.0, a.warm, rng, sessions, a.drain,
+                           arrival=rates[0])
+            bench.rows = [r for r in bench.rows if r["rate"] != -1.0]
+
+            results = []
+            for rate in rates:
+                print(f"\n--- offering {rate} req/s for {a.secs}s ---", flush=True)
+                t0 = await run_rate(client, bench, rate, a.secs, rng, sessions, a.drain)
+                s = summarise(bench, rate, t0)
+                if s is None:
+                    print("    => no arrivals in this interval", flush=True)
+                    continue
+                results.append(s)
+                print(f"    => displayed tok/s {s['med_tok_s']:.1f}  completed {s['completed_pct']:.1f}%  "
+                      f"429 {s['r429']}  TTFT p50 {s['ttft_p50']:.2f}s p99 {s['ttft_p99']:.2f}s", flush=True)
+
+        print(f"\n{'='*94}\nRATE vs ROUTER-DISPLAYED STATS  (peak in-flight: {bench.peak_inflight})\n{'='*94}")
+        print(f"  {'offered':>8s} {'actual':>7s} {'tok/s/req':>9s} {'complete':>9s} {'429':>6s} {'err':>5s} "
+              f"{'out tok/s':>10s} {'in tok/s':>9s} {'TTFTp50':>8s} {'TTFTp90':>8s} {'TTFTp99':>8s}")
+        for s in results:
+            print(f"  {s['rate']:8.1f} {s['offered_rps']:7.2f} {s['med_tok_s']:9.1f} "
+                  f"{s['completed_pct']:8.1f}% {s['r429']:6d} {s['othererr']:5d} {s['out_tps']:10.1f} {s['in_tps']:9.0f} "
+                  f"{s['ttft_p50']:7.2f}s {s['ttft_p90']:7.2f}s {s['ttft_p99']:7.2f}s")
+        print(f"\n{'='*94}\nPER-SLICE: who consumes the capacity\n{'='*94}")
+        print(f"  {'slice':9s} {'reqs':>6s} {'%reqs':>6s} {'input tokens':>14s} {'%input':>7s} {'tok/s/req':>9s} {'TTFTp50':>8s}")
+        tot_in = sum((r["prompt_tokens"] or 0) for r in bench.rows if r["completed"])
+        tot_n  = len([r for r in bench.rows if r["rate"] > 0])
+        for nm, *_ in SLICES:
+            g = [r for r in bench.rows if r["slice"] == nm and r["rate"] > 0]
+            if not g: continue
+            d = [r for r in g if r["completed"]]
+            ti = sum((r["prompt_tokens"] or 0) for r in d)
+            speeds = [r["tok_per_s"] for r in d if r["tok_per_s"] is not None]
+            mt = st.median(speeds) if speeds else 0.0
+            print(f"  {nm:9s} {len(g):6d} {100*len(g)/max(tot_n,1):5.1f}% {ti:14,d} "
+                  f"{100*ti/max(tot_in,1):6.1f}% {mt:9.1f} {pct([r['ttft_s'] for r in d if r['ttft_s'] is not None],.50):7.2f}s")
+        print("\n  Operating point: highest rate where displayed tok/s stays competitive")
+        print("  vs the model's provider page, TTFT is flat, completion ~100%, 429 ~ 0.")
+        print("  (A router displays MEDIANS measured on routed traffic and routes on")
+        print("   them; there is no pass/fail bar — do not introduce one here.)")
+        bench.f.close()
+
+    if __name__ == "__main__":
+        asyncio.run(main())
+  wait_ready.py: |
+    """Exit 0 when the serving deployment is fully up, 1 otherwise, one status
+    line either way. Fully up = every worker pod is Ready (the Kubernetes API,
+    read with this Job's ServiceAccount — the recipe's kimi-k3-serving, which
+    may list pods) AND the router lists at least as many active workers on its
+    /v1/workers AND, for a prefill/decode deployment, both roles are present.
+    When the API is not reachable (no token, RBAC) the router's view alone
+    decides. EXPECT_WORKERS (env) adds a floor on the router's active count.
+    Why: a load test that starts while a role is missing measures 503s (the
+    router refuses every request until one prefill and one decode worker are
+    up), and one that starts before the last worker measures a smaller
+    deployment than the one you paid for. On success the worker count is
+    left in WORKERS_FILE (/tmp/workers) for the Job's shell, which picks the
+    default sweep by it."""
+    import os
+    import sys
+
+    import httpx
+
+    ROUTER = sys.argv[1]
+    WORKERS_FILE = os.environ.get("WORKERS_FILE", "/tmp/workers")
+    LABEL = os.environ.get("WORKER_LABEL", "app.kubernetes.io/name=kimi-k3-infera")
+    EXPECT = int(os.environ.get("EXPECT_WORKERS") or 0)
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def pods():
+        """(ready, total) over the worker pods, or None when the API is out of
+        reach for this Job."""
+        try:
+            tok = open(f"{SA}/token").read().strip()
+            ns = open(f"{SA}/namespace").read().strip()
+            r = httpx.get(f"https://kubernetes.default.svc/api/v1/namespaces/{ns}/pods",
+                          params={"labelSelector": LABEL},
+                          headers={"Authorization": f"Bearer {tok}"},
+                          verify=f"{SA}/ca.crt", timeout=10)
+            if r.status_code != 200:
+                return None
+            items = r.json().get("items") or []
+            ready = sum(1 for p in items
+                        if any(c.get("type") == "Ready" and c.get("status") == "True"
+                               for c in (p.get("status") or {}).get("conditions") or []))
+            return ready, len(items)
+        except Exception:
+            return None
+
+
+    def workers():
+        try:
+            r = httpx.get(f"{ROUTER}/v1/workers", timeout=10)
+            if r.status_code != 200:
+                return []
+            return [w for w in (r.json().get("workers") or [])
+                    if str(w.get("status") or "").lower() == "active"]
+        except Exception:
+            return []
+
+
+    w = workers()
+    modes = [str(x.get("disagg_mode") or "").upper() for x in w]
+    pd = any("PREFILL" in m or "DECODE" in m for m in modes)
+    roles_ok = (not pd) or (any("PREFILL" in m for m in modes)
+                            and any("DECODE" in m for m in modes))
+    p = pods()
+    if p is None:
+        ok = bool(w) and roles_ok and len(w) >= EXPECT
+        print(f"[loadtest] router sees {len(w)} active worker(s), roles complete: "
+              f"{'yes' if roles_ok else 'no'} (worker pods not visible to this Job)",
+              flush=True)
+    else:
+        ready, total = p
+        ok = (total >= 1 and ready == total and len(w) >= total
+              and roles_ok and len(w) >= EXPECT)
+        print(f"[loadtest] workers ready: {ready}/{total} · router sees {len(w)} "
+              f"active · roles complete: {'yes' if roles_ok else 'no'}", flush=True)
+    if ok:
+        with open(WORKERS_FILE, "w") as f:
+            f.write(str(p[1] if p is not None else len(w)))
+    sys.exit(0 if ok else 1)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-loadtest
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-loadtest
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  backoffLimit: 0
+  # an hour to read the pod's log after the run; the results on the shared
+  # volume stay regardless (see the header)
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kimi-k3-loadtest
+        app.kubernetes.io/part-of: kimi-k3
+    spec:
+      restartPolicy: Never
+      # the serving recipe's ServiceAccount (it may list pods): how the
+      # readiness wait sees the worker pods. Apply the serving manifest first.
+      serviceAccountName: kimi-k3-serving
+      # CPU worker only: no GPU request, no GPU toleration. Present from the
+      # cluster's first minute, and next to the router.
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      containers:
+        - name: loadtest
+          image: python:3.12-slim
+          env:
+            # the router's OpenAI-compatible endpoint, in-cluster
+            - {name: ORBENCH_BASE, value: "http://infera:8000/v1/chat/completions"}
+            - {name: ORBENCH_MODEL, value: "moonshotai/Kimi-K3"}
+            # the worker pods the readiness wait counts (both recipes' label);
+            # EXPECT_WORKERS adds a floor on the router's active count ("" = off)
+            - {name: WORKER_LABEL, value: "app.kubernetes.io/name=kimi-k3-infera"}
+            - {name: EXPECT_WORKERS, value: ""}
+            # the sweep: offered request rates (req/s), seconds per rate,
+            # warm-up seconds (discarded), drain seconds between rates. RATES
+            # empty = by the deployment found: one worker 0.25,0.5,1,2; more
+            # workers 0.5,1,2,4 (see the header). Set it to sweep differently.
+            - {name: RATES, value: ""}
+            - {name: SECS, value: "120"}
+            - {name: WARM, value: "60"}
+            - {name: DRAIN, value: "120"}
+            - {name: SEED, value: "20260804"}
+            # how long to wait for the deployment to come up before giving up
+            - {name: WAIT_MAX, value: "5400"}
+            # how to read a finished run's results later (printed at the end)
+            - {name: RESULTS_READER, value: "kubectl apply -f k8s/market/loadtest-results.yaml && kubectl logs -f job/kimi-k3-loadtest-results"}
+          command:
+            - bash
+            - -euo
+            - pipefail
+            - -c
+            - |
+              pip install --quiet --no-cache-dir 'httpx>=0.27'
+              ROUTER="${ORBENCH_BASE%/v1/*}"
+              echo "[loadtest] waiting for every worker to be ready and discovered by the router at $ROUTER (up to $WAIT_MAX s)"
+              T0=$(date +%s)
+              until python3 /bench/wait_ready.py "$ROUTER"; do
+                if [ $(( $(date +%s) - T0 )) -ge "$WAIT_MAX" ]; then
+                  echo "[loadtest] the deployment did not come up within $WAIT_MAX s"; exit 3
+                fi
+                sleep 30
+              done
+              echo "[loadtest] deployment up after $(( $(date +%s) - T0 )) s"
+              WORKERS=$(cat /tmp/workers 2>/dev/null || echo 0)
+              if [ -z "$RATES" ]; then
+                if [ "$WORKERS" -le 1 ]; then RATES="0.25,0.5,1,2"; else RATES="0.5,1,2,4"; fi
+                echo "[loadtest] RATES not set: $WORKERS worker(s) up, sweeping $RATES req/s"
+              fi
+              # results: on the shared volume when this cluster has one (a real
+              # mount at /shared) — the per-request CSV, the full console output
+              # as a .log, and latest.* pointing at this run — so they outlive
+              # this Job; else the pod's /tmp (gone with it)
+              OUT=/tmp; ON_VOLUME=0
+              if grep -q " /shared " /proc/mounts; then
+                OUT=/shared/kimi-k3/loadtest; mkdir -p "$OUT"; ON_VOLUME=1
+              fi
+              TS=$(date -u +%Y%m%dT%H%M%SZ)
+              CSV="$OUT/orbench-$TS.csv"; LOG="$OUT/orbench-$TS.log"
+              echo "[loadtest] rates $RATES req/s · $SECS s each · warm $WARM s · drain $DRAIN s · results $OUT/orbench-$TS.log and .csv"
+              set +e
+              python3 -u /bench/orbench.py --rates "$RATES" --secs "$SECS" --warm "$WARM" --drain "$DRAIN" --seed "$SEED" --csv "$CSV" 2>&1 | tee "$LOG"
+              RC=${PIPESTATUS[0]}
+              set -e
+              if [ "$ON_VOLUME" = 1 ]; then
+                cp -f "$LOG" "$OUT/latest.log"
+                cp -f "$CSV" "$OUT/latest.csv" 2>/dev/null || true
+                echo "[loadtest] results saved on the shared volume: $LOG (and .csv); latest.log / latest.csv point at this run."
+                echo "[loadtest] read them any time, after this Job is gone too: $RESULTS_READER"
+              else
+                echo "[loadtest] no shared volume on this cluster: the results live in this pod's log until the Job is removed"
+              fi
+              exit "$RC"
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {memory: 16Gi}
+          volumeMounts:
+            - {name: bench, mountPath: /bench, readOnly: true}
+            - {name: shared, mountPath: /shared}
+      volumes:
+        - name: bench
+          configMap: {name: kimi-k3-loadtest}
+        - name: shared
+          # no type: a cluster without the volume still runs the test (the
+          # results then stay in the pod); the script checks for a real mount
+          hostPath: {path: /mnt/shared}

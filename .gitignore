@@ -25,3 +25,9 @@ kubeconfig*
 *.pth
 *.ckpt
 pytorch_model*.bin
+
+# Controlled replay fixtures and receipts
+*.replay.json
+.bench-results/
+.pytest_cache/
+*.replay.json.gz

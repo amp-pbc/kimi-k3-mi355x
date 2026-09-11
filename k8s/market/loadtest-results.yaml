@@ -1,0 +1,63 @@
+# Read the Kimi-K3 load test's results from the shared volume: a Job pinned
+# to the cluster's CPU worker (no GPU, never reclaimed by the market) that
+# lists the runs under /mnt/shared/kimi-k3/loadtest/ and prints one — the
+# newest by default — then exits.
+#
+# Why this exists: k8s/market/loadtest.yaml removes itself an hour after it
+# finishes and its console output goes with the pod; the copy on the shared
+# volume (orbench-<time>.log, the per-request orbench-<time>.csv beside it,
+# latest.* pointing at the newest run) is what remains, and this reads it
+# without touching the serving deployment.
+#
+#   Run:    kubectl apply -f k8s/market/loadtest-results.yaml
+#   Read:   kubectl logs -f job/kimi-k3-loadtest-results
+#   Older:  set RUN below to a timestamp from the list it prints
+#           (e.g. 20260909T221513Z) and apply again
+#   Clean:  nothing to do — the Job removes itself two minutes after it
+#           finishes; `kubectl delete job kimi-k3-loadtest-results` to re-run sooner.
+#
+# Needs a cluster with a shared volume: the hostPath's `type: Directory` fails
+# the pod loudly where /mnt/shared is not mounted.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k3-loadtest-results
+  namespace: default
+  labels:
+    app.kubernetes.io/name: kimi-k3-loadtest-results
+    app.kubernetes.io/part-of: kimi-k3
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/cpu: ""
+      containers:
+        - name: read
+          image: busybox:1.36
+          env:
+            # "latest", or a run's timestamp as listed (orbench-<RUN>.log)
+            - {name: RUN, value: latest}
+          command: ["sh", "-c"]
+          args:
+            - |
+              D=/mnt/shared/kimi-k3/loadtest
+              if [ ! -d "$D" ]; then
+                echo "no load-test results at $D yet - the load test creates them when it runs"; exit 0
+              fi
+              echo "runs on the volume, newest first:"
+              ls -1t "$D"/orbench-*.log 2>/dev/null | sed 's#.*/orbench-##; s#\.log$##' | head -20
+              if [ "$RUN" = latest ]; then F="$D/latest.log"; else F="$D/orbench-$RUN.log"; fi
+              echo; echo "=== $F ==="
+              if [ -f "$F" ]; then
+                cat "$F"
+              else
+                echo "no such run - set RUN to one of the timestamps above, or latest"
+              fi
+          volumeMounts:
+            - {name: shared, mountPath: /mnt/shared, readOnly: true}
+      volumes:
+        - name: shared
+          hostPath: {path: /mnt/shared, type: Directory}

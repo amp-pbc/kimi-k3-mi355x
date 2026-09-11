@@ -156,6 +156,9 @@ based on mixed-output sweeps. When in doubt, keep the cap and validate hard.
 
 ## See also
 
+- Market (dynamic) clusters have their own traps — the Kueue pods-ready
+  eviction loop, re-staging on every mode switch, partial PD while nodes
+  arrive: [`07-market-clusters.md`](07-market-clusters.md).
 - Host-level PeerDirect / GPU-direct RDMA enablement (the prerequisite for PD):
   [`01-host-prep.md`](01-host-prep.md).
 - AMD's reference manifests, preflight scripts, and `KNOWN-ISSUES.md` for this
