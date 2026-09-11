@@ -83,6 +83,42 @@ reuse, **not decode saturation or representative production capacity**. After
 routing passes, repeat with a recorded workload matching real input/output
 lengths before publishing a throughput claim.
 
+### Input-heavy throughput exploration
+
+The `input-heavy` scenario provides a reproducible synthetic starting point:
+70% of newly created session contexts target 8k–32k input tokens and 30% target
+32k–64k. It uses output budgets of 128, 256 or 512 tokens and shuffles the
+session order separately on each turn. Earlier turns still complete before
+their successors. Inputs are synthetic identifiers and successor histories
+are recorded text, not generated replies or an actual OpenRouter traffic trace.
+Token targets are estimates; use returned usage for actual input/output lengths.
+
+```bash
+python3 bench/controlled_replay.py generate \
+  --scenario input-heavy --sessions 90 --turns 4 --rate 2 \
+  --seed 20260911 --salt heavy001 --out /tmp/kimi-heavy.json.gz
+```
+
+This offers 360 requests over approximately 180 seconds. For a rate sweep,
+keep approximately the same arrival-window duration by scaling session count
+with offered rate, and give each arm a distinct early-prefix salt. Larger
+fixtures belong on the shared volume rather than in a ConfigMap. Run an
+unmeasured representative warmup first, then require idle engines around every
+measurement. Increase load in bounded steps and repeat the best useful rate.
+
+The summary includes logical input tokens/s (including cached input), output
+tokens/s, actual token totals, usage completeness, peak client in-flight count,
+offered arrival window, and p99 causal dispatch delay. Both token rates divide
+by elapsed replay time through the final completion, including drain time.
+Keep the before/after engine counters and sample queue depth during the run.
+Separate cache-hit token volume from newly computed work; inspect the deployed
+engine's metric semantics before interpreting query-minus-hit as compute.
+Report per-worker counts, TTFT, failures and queue growth with throughput.
+Substantial dispatch delay means the causal driver could not maintain the
+offered schedule, so that arm cannot establish sustainable service capacity.
+A successful synthetic sweep is evidence for its measured workload, not a
+general production-capacity or OpenRouter-performance guarantee.
+
 Example preparation (local files only):
 
 ```bash
