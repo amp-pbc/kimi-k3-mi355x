@@ -95,6 +95,13 @@ PD attempt. See [06-traps.md](06-traps.md).
 
 ## DSpark speculative decoding
 
+**DCP upgrade:** basic AITER MLA DCP is available in upstream vLLM 0.29.0, but
+the current custom DSpark image and its Infera/Mooncake integration need a
+compatible rebuild and validation before enabling it here. The optimized ASM
+verification path for DCP plus speculation is also still in review. See the
+[DCP configuration and upgrade requirements](10-decode-context-parallel.md)
+before changing the image, DCP sizes, or the speculative configuration.
+
 DSpark raises per-request decode speed. Its `--speculative-config` (method
 `dspark`, the draft model path, `num_speculative_tokens`, and the MLA attention
 backend) must be set on **both** roles, and the draft model must be staged on

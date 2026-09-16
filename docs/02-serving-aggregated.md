@@ -47,6 +47,11 @@ locally.
 
 ## The manifest
 
+For an opt-in single-node DCP trial, use the separate
+[ROCm vLLM 0.29.0 configuration](10-decode-context-parallel.md). That guide
+pins the independently tested image and paired SiTU settings. It does not upgrade
+the older Infera-based manifest below or claim a throughput improvement.
+
 The aggregated deployment is at
 [`k8s/aggregated/kimi-k3-aggregated.yaml`](../k8s/aggregated/kimi-k3-aggregated.yaml).
 It defines, in one file:
