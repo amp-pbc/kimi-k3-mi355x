@@ -31,6 +31,12 @@ vLLM-native distributed PD isn't supported yet
 here uses the **AMD Infera operator + Mooncake**, not vLLM's own distributed
 inference. If in doubt, start aggregated.
 
+For long-context capacity experiments, see the
+[AITER MLA DCP guide](docs/10-decode-context-parallel.md). It records AMD's
+single-node TP8/DCP8 configuration on a pinned ROCm vLLM 0.29.0 image. AMD
+reported about 3.85× KV capacity but 7–9% lower short-context throughput;
+long-context performance and the PD + DSpark upgrade require separate tests.
+
 ## Layout
 
 ```
@@ -42,6 +48,7 @@ docs/
   05-benchmarking.md       how to load-test and score it (OpenRouter-style view)
   06-traps.md              cluster traps that cost hours
   08-kv-aware-routing.md   tokenizer, image fix, policy weights, validation
+  10-decode-context-parallel.md  opt-in AITER DCP and PD/DSpark upgrade gates
 k8s/
   weights-stage-job.yaml   stage the ~1.5 TB checkpoint + DSpark draft to NVMe
   aggregated/              self-contained aggregated serving (DaemonSet + router)
