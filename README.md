@@ -32,10 +32,12 @@ here uses the **AMD Infera operator + Mooncake**, not vLLM's own distributed
 inference. If in doubt, start aggregated.
 
 For long-context capacity experiments, see the
-[AITER MLA DCP guide](docs/10-decode-context-parallel.md). It records AMD's
-single-node TP8/DCP8 configuration on a pinned ROCm vLLM 0.29.0 image. AMD
-reported about 3.85× KV capacity but 7–9% lower short-context throughput;
-long-context performance and the PD + DSpark upgrade require separate tests.
+[AITER MLA DCP guide](docs/10-decode-context-parallel.md). Our
+[single-node comparison](docs/benchmarks/dcp-2026-09-16.md) on the pinned ROCm
+vLLM 0.29.0 image passed correctness smoke checks and confirmed about 4×
+reported KV capacity. Short-input throughput was 6–9% lower; throughput on
+synthetic 28K inputs was essentially unchanged. The PD + DSpark upgrade still
+requires a compatible image and separate validation.
 
 ## Layout
 

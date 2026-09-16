@@ -1,9 +1,13 @@
 # 10 — Decode context parallelism on MI355X
 
-**Status, 2026-09-16:** AMD reported a working single-node TP8/DCP8 Kimi-K3
-configuration using the upstream ROCm vLLM 0.29.0 image below. This is an opt-in
-aggregated experiment. It has not been independently rerun for this guide and
-does not validate the repository's multi-node Infera + Mooncake + DSpark path.
+**Status, 2026-09-16:** We independently tested single-node TP8/DCP1 versus
+TP8/DCP8 using the upstream ROCm vLLM 0.29.0 image below. Both passed six
+correctness smoke checks and all 1,344 measured requests completed. DCP8
+increased reported KV capacity by 3.985×, but showed no material throughput
+gain on the synthetic input-heavy workload. See the
+[measured results and limitations](benchmarks/dcp-2026-09-16.md). This remains
+an opt-in aggregated configuration and does not validate the repository's
+multi-node Infera + Mooncake + DSpark path.
 
 DCP partitions the attention KV cache by token position across the existing
 tensor-parallel group. TP8/DCP8 uses eight GPUs in total. It can free cache
